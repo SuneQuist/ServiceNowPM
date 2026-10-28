@@ -1,0 +1,5031 @@
+<?xml version="1.0" encoding="utf-8"?>
+<j:jelly trim="false"
+         xmlns:j="jelly:core"
+         xmlns:g="glide">
+
+<g:evaluate var="jvar_plan_json">
+
+var uiaResult = (function () {
+
+    var TABLE = 'x_2280382_uiasyste_uia';
+
+    var incidentId = String(
+        RP.getParameterValue('sysparm_incident_id') || ''
+    );
+
+    var action = String(
+        RP.getParameterValue('sysparm_uia_action') || ''
+    );
+
+    var activeTab = String(
+        RP.getParameterValue('sysparm_uia_tab') || 'overview'
+    );
+
+    var allowedTabs = {
+        overview: true,
+        intelligence: true,
+        ssvc: true,
+        plan: true,
+        investigation: true,
+        history: true
+    };
+
+    if (!allowedTabs[activeTab]) {
+        activeTab = 'overview';
+    }
+
+    var message = '';
+    var isError = false;
+    var differences = [];
+    var autoApplied = false;
+
+    function str(value) {
+        if (value === null || value === undefined) {
+            return '';
+        }
+        return String(value);
+    }
+
+    function clean(value) {
+        return str(value).replace(/^\s+|\s+$/g, '');
+    }
+
+    function short(value, limit) {
+        return str(value).substring(0, limit);
+    }
+
+    function allowed(value, choices) {
+        return choices.indexOf(value) !== -1
+            ? value
+            : 'unknown';
+    }
+
+    // Evidence is untrusted, user-entered supporting material.
+    // Never treat it as verified SSVC or NVD/CISA evidence.
+    function cleanEvidence(raw) {
+        var evidence = { links: [], notes: '' };
+        if (!raw || typeof raw !== 'object') {
+            return evidence;
+        }
+        evidence.notes = short(clean(raw.notes), 700);
+        var links = raw.links instanceof Array ? raw.links : [];
+        for (var i = 0; i !== links.length; i++) {
+            if (evidence.links.length >= 5) {
+                break;
+            }
+            if (!links[i] || typeof links[i] !== 'object') {
+                continue;
+            }
+            var url = short(clean(links[i].url), 300);
+            if (!/^https:\/\/[^\s]+$/i.test(url)) {
+                continue;
+            }
+            evidence.links.push({
+                url: url,
+                comment: short(clean(links[i].comment), 180)
+            });
+        }
+        return evidence;
+    }
+
+    function postedEvidence(fallback) {
+        var raw = clean(RP.getParameterValue('sysparm_uia_evidence'));
+        if (!raw) {
+            return cleanEvidence(fallback);
+        }
+        try {
+            return cleanEvidence(JSON.parse(raw));
+        } catch (ignore) {
+            return cleanEvidence(fallback);
+        }
+    }
+
+    function searchKnowledge(phrase) {
+        var matches = [];
+        var term = short(clean(phrase), 100);
+        if (term.length &lt; 3) {
+            return matches;
+        }
+        try {
+            var kb = new GlideRecordSecure('kb_knowledge');
+            if (!kb.isValid() || !kb.canRead()) {
+                return matches;
+            }
+            var q = kb.addQuery('short_description', 'CONTAINS', term);
+            q.addOrCondition('text', 'CONTAINS', term);
+            kb.addQuery('workflow_state', 'published');
+            kb.setLimit(8);
+            kb.query();
+            while (kb.next()) {
+                if (!kb.canRead()) {
+                    continue;
+                }
+                matches.push({
+                    id: str(kb.getUniqueValue()),
+                    number: short(kb.getValue('number'), 30),
+                    title: short(kb.getDisplayValue('short_description'), 180)
+                });
+            }
+        } catch (ignore) {
+            // KB may not be available to this scoped PDI application.
+        }
+        return matches;
+    }
+
+    function emptyInputs() {
+        return {
+            cve: '',
+            applicability: 'unknown',
+            exploitation: 'unknown',
+            exposure: 'unknown',
+            automatable: 'unknown',
+            valueDensity: 'unknown',
+            safety: 'unknown',
+            mission: 'unknown',
+            patch: 'unknown'
+        };
+    }
+
+    function requestInputs() {
+
+        return {
+            cve: short(
+                clean(
+                    RP.getParameterValue('sysparm_uia_cve')
+                ).toUpperCase(),
+                30
+            ),
+
+            applicability: allowed(
+                clean(RP.getParameterValue(
+                    'sysparm_uia_applicability'
+                )),
+                ['unknown', 'affected', 'not_affected']
+            ),
+
+            exploitation: allowed(
+                clean(RP.getParameterValue(
+                    'sysparm_uia_exploitation'
+                )),
+                ['unknown', 'none', 'poc', 'active']
+            ),
+
+            exposure: allowed(
+                clean(RP.getParameterValue(
+                    'sysparm_uia_exposure'
+                )),
+                ['unknown', 'small', 'controlled', 'open']
+            ),
+
+            automatable: allowed(
+                clean(RP.getParameterValue(
+                    'sysparm_uia_automatable'
+                )),
+                ['unknown', 'no', 'yes']
+            ),
+
+            valueDensity: allowed(
+                clean(RP.getParameterValue(
+                    'sysparm_uia_value_density'
+                )),
+                ['unknown', 'diffuse', 'concentrated']
+            ),
+
+            safety: allowed(
+                clean(RP.getParameterValue(
+                    'sysparm_uia_safety'
+                )),
+                [
+                    'unknown',
+                    'minor',
+                    'major',
+                    'hazardous',
+                    'catastrophic'
+                ]
+            ),
+
+            mission: allowed(
+                clean(RP.getParameterValue(
+                    'sysparm_uia_mission'
+                )),
+                [
+                    'unknown',
+                    'limited',
+                    'mef_failure',
+                    'mission_failure'
+                ]
+            ),
+
+            patch: allowed(
+                clean(RP.getParameterValue(
+                    'sysparm_uia_patch'
+                )),
+                [
+                    'unknown',
+                    'available',
+                    'unavailable',
+                    'unsupported'
+                ]
+            )
+        };
+    }
+
+    /*
+     * External intelligence normalization.
+     *
+     * The recommendation field has a 4000-character
+     * maximum, so saved intelligence is compact.
+     */
+
+    function compactIntel(source) {
+
+        if (!source) {
+            return null;
+        }
+
+        var result = {
+            cve: short(source.cve, 30),
+            retrievedAt: short(source.retrievedAt, 60),
+            nvd: null,
+            kev: null,
+            epss: null,
+            sourceStatus: {
+                nvd: 'unknown',
+                kev: 'unknown',
+                epss: 'unknown'
+            },
+            errors: []
+        };
+
+        if (source.sourceStatus) {
+            var names = ['nvd', 'kev', 'epss'];
+
+            for (var s = 0; s !== names.length; s++) {
+                var name = names[s];
+                var status = str(source.sourceStatus[name]);
+
+                if (
+                    status === 'updated' ||
+                    status === 'retained' ||
+                    status === 'unavailable'
+                ) {
+                    result.sourceStatus[name] = status;
+                }
+            }
+        }
+
+        if (source.nvd) {
+
+            result.nvd = {
+                found: source.nvd.found === true,
+                description: short(
+                    source.nvd.description, 450
+                ),
+                score: short(source.nvd.score, 20),
+                severity: short(source.nvd.severity, 30),
+                modified: short(source.nvd.modified, 60),
+                references: []
+            };
+
+            var references = source.nvd.references || [];
+
+            for (
+                var r = 0;
+                r !== references.length;
+                r++
+            ) {
+                var url = short(references[r], 350);
+
+                if (/^https:\/\//i.test(url)) {
+                    result.nvd.references.push(url);
+                }
+
+                if (result.nvd.references.length >= 3) {
+                    break;
+                }
+            }
+        }
+
+        if (source.kev) {
+
+            result.kev = {
+                listed: source.kev.listed === true,
+                dateAdded: short(
+                    source.kev.dateAdded, 30
+                ),
+                vendor: short(source.kev.vendor, 100),
+                product: short(source.kev.product, 100),
+                requiredAction: short(
+                    source.kev.requiredAction, 300
+                )
+            };
+        }
+
+        if (source.epss) {
+
+            var probability = Number(
+                source.epss.probability
+            );
+
+            var percentile = Number(
+                source.epss.percentile
+            );
+
+            result.epss = {
+                found: source.epss.found === true,
+
+                probability:
+                    source.epss.probability === null ||
+                    source.epss.probability === undefined ||
+                    !isFinite(probability)
+                        ? null
+                        : probability,
+
+                percentile:
+                    source.epss.percentile === null ||
+                    source.epss.percentile === undefined ||
+                    !isFinite(percentile)
+                        ? null
+                        : percentile,
+
+                date: short(source.epss.date, 30)
+            };
+        }
+
+        var errors = source.errors || [];
+
+        for (var e = 0; e !== errors.length; e++) {
+
+            result.errors.push(
+                short(errors[e], 180)
+            );
+
+            if (result.errors.length >= 5) {
+                break;
+            }
+        }
+
+        return result;
+    }
+
+    /*
+     * The hidden intelligence field preserves fetched
+     * data across page submissions.
+     *
+     * It is not a trusted evidence store. Production
+     * use requires server-side verified snapshots.
+     */
+
+    function submittedIntel(expectedCve) {
+
+        var raw = str(
+            RP.getParameterValue(
+                'sysparm_uia_intelligence'
+            )
+        );
+
+        if (!raw || raw.length > 12000) {
+            return null;
+        }
+
+        try {
+
+            var parsed = JSON.parse(raw);
+
+            if (parsed.cve !== expectedCve) {
+                return null;
+            }
+
+            return compactIntel(parsed);
+
+        } catch (ignore) {
+            return null;
+        }
+    }
+
+    function fetchJson(url, source, result) {
+
+        try {
+
+            var request = new sn_ws.RESTMessageV2();
+
+            request.setEndpoint(url);
+            request.setHttpMethod('get');
+            request.setHttpTimeout(12000);
+
+            request.setRequestHeader(
+                'Accept',
+                'application/json'
+            );
+
+            var response = request.execute();
+            var status = response.getStatusCode();
+
+            if (status !== 200) {
+
+                result.errors.push(
+                    source + ': HTTP ' + status
+                );
+
+                return null;
+            }
+
+            return JSON.parse(
+                response.getBody()
+            );
+
+        } catch (error) {
+
+            result.errors.push(
+                source + ': ' +
+                short(error.message || error, 120)
+            );
+
+            return null;
+        }
+    }
+
+    /*
+     * Fetch NVD, CISA KEV and FIRST EPSS.
+     *
+     * Return intelligence plus a separate flag
+     * indicating whether KEV was actually retrieved
+     * and parsed in this request.
+     *
+     * A stale retained KEV snapshot may be displayed,
+     * but will not trigger a new automatic prefill.
+     */
+
+    function lookup(cve, previous) {
+
+        var result = {
+            cve: cve,
+            retrievedAt:
+                new GlideDateTime().getDisplayValue(),
+            nvd: null,
+            kev: null,
+            epss: null,
+            sourceStatus: {
+                nvd: 'unavailable',
+                kev: 'unavailable',
+                epss: 'unavailable'
+            },
+            errors: []
+        };
+
+        var freshKev = false;
+
+        if (!/^CVE-[0-9]{4}-[0-9]{4,}$/.test(cve)) {
+
+            result.errors.push(
+                'Enter a valid CVE identifier.'
+            );
+
+            return {
+                intelligence: compactIntel(result),
+                freshKev: false
+            };
+        }
+
+        // NVD - read-only.
+
+        var nvd = fetchJson(
+            'https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=' +
+            encodeURIComponent(cve),
+            'NVD',
+            result
+        );
+
+        if (
+            nvd &amp;&amp;
+            nvd.vulnerabilities &amp;&amp;
+            typeof nvd.vulnerabilities.length === 'number'
+        ) {
+
+            result.sourceStatus.nvd = 'updated';
+
+            result.nvd = {
+                found: false,
+                description: '',
+                score: '',
+                severity: '',
+                modified: '',
+                references: []
+            };
+
+            var vulnerabilities = nvd.vulnerabilities;
+
+            if (vulnerabilities.length) {
+
+                var record =
+                    vulnerabilities[0].cve || {};
+
+                result.nvd.found = true;
+                result.nvd.modified =
+                    record.lastModified || '';
+
+                var descriptions =
+                    record.descriptions || [];
+
+                for (
+                    var d = 0;
+                    d !== descriptions.length;
+                    d++
+                ) {
+                    if (descriptions[d].lang === 'en') {
+
+                        result.nvd.description =
+                            descriptions[d].value || '';
+
+                        break;
+                    }
+                }
+
+                var metrics = record.metrics || {};
+
+                var metricList =
+                    metrics.cvssMetricV40 ||
+                    metrics.cvssMetricV31 ||
+                    metrics.cvssMetricV30 ||
+                    metrics.cvssMetricV2 ||
+                    [];
+
+                if (metricList.length) {
+
+                    var chosen = metricList[0];
+
+                    for (
+                        var m = 0;
+                        m !== metricList.length;
+                        m++
+                    ) {
+                        if (metricList[m].type === 'Primary') {
+                            chosen = metricList[m];
+                            break;
+                        }
+                    }
+
+                    var cvss = chosen.cvssData || {};
+
+                    result.nvd.score =
+                        cvss.baseScore === undefined
+                            ? ''
+                            : str(cvss.baseScore);
+
+                    result.nvd.severity =
+                        cvss.baseSeverity ||
+                        chosen.baseSeverity ||
+                        '';
+                }
+
+                var refs = record.references || [];
+
+                for (
+                    var r = 0;
+                    r !== refs.length;
+                    r++
+                ) {
+
+                    var url = str(refs[r].url);
+
+                    if (!/^https:\/\//i.test(url)) {
+                        continue;
+                    }
+
+                    if (
+                        result.nvd.references.indexOf(url)
+                        !== -1
+                    ) {
+                        continue;
+                    }
+
+                    result.nvd.references.push(url);
+
+                    if (
+                        result.nvd.references.length >= 3
+                    ) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // CISA KEV - read-only.
+
+        var kev = fetchJson(
+            'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json',
+            'CISA KEV',
+            result
+        );
+
+        if (
+            kev &amp;&amp;
+            kev.vulnerabilities &amp;&amp;
+            typeof kev.vulnerabilities.length === 'number'
+        ) {
+
+            freshKev = true;
+            result.sourceStatus.kev = 'updated';
+
+            result.kev = {
+                listed: false,
+                dateAdded: '',
+                vendor: '',
+                product: '',
+                requiredAction: ''
+            };
+
+            var entries = kev.vulnerabilities;
+
+            for (
+                var k = 0;
+                k !== entries.length;
+                k++
+            ) {
+
+                if (entries[k].cveID === cve) {
+
+                    var match = entries[k];
+
+                    result.kev.listed = true;
+                    result.kev.dateAdded =
+                        match.dateAdded || '';
+                    result.kev.vendor =
+                        match.vendorProject || '';
+                    result.kev.product =
+                        match.product || '';
+                    result.kev.requiredAction =
+                        match.requiredAction || '';
+
+                    break;
+                }
+            }
+        }
+
+        // FIRST EPSS - read-only.
+
+        var epss = fetchJson(
+            'https://api.first.org/data/v1/epss?cve=' +
+            encodeURIComponent(cve),
+            'FIRST EPSS',
+            result
+        );
+
+        if (
+            epss &amp;&amp;
+            epss.data &amp;&amp;
+            typeof epss.data.length === 'number'
+        ) {
+
+            result.sourceStatus.epss = 'updated';
+
+            result.epss = {
+                found: false,
+                probability: null,
+                percentile: null,
+                date: ''
+            };
+
+            if (epss.data.length) {
+
+                var item = epss.data[0];
+
+                result.epss.found = true;
+                result.epss.probability =
+                    parseFloat(item.epss);
+                result.epss.percentile =
+                    parseFloat(item.percentile);
+                result.epss.date =
+                    item.date || '';
+            }
+        }
+
+        /*
+         * Preserve existing source evidence on
+         * temporary API failures, while explicitly
+         * marking it as retained rather than updated.
+         */
+
+        if (previous) {
+
+            if (!result.nvd &amp;&amp; previous.nvd) {
+                result.nvd = previous.nvd;
+                result.sourceStatus.nvd = 'retained';
+            }
+
+            if (!result.kev &amp;&amp; previous.kev) {
+                result.kev = previous.kev;
+                result.sourceStatus.kev = 'retained';
+            }
+
+            if (!result.epss &amp;&amp; previous.epss) {
+                result.epss = previous.epss;
+                result.sourceStatus.epss = 'retained';
+            }
+        }
+
+        return {
+            intelligence: compactIntel(result),
+            freshKev: freshKev
+        };
+    }
+
+    function compareIntel(previous, current) {
+
+        var changes = [];
+
+        if (!current) {
+            return changes;
+        }
+
+        if (!previous) {
+
+            changes.push(
+                'Initial vulnerability intelligence retrieved.'
+            );
+
+            return changes;
+        }
+
+        if (previous.cve !== current.cve) {
+
+            changes.push(
+                'CVE identifier changed.'
+            );
+
+            return changes;
+        }
+
+        if (current.kev) {
+
+            if (!previous.kev) {
+
+                changes.push(
+                    'CISA KEV information became available.'
+                );
+
+            } else if (
+                current.kev.listed !== previous.kev.listed
+            ) {
+
+                changes.push(
+                    'CISA KEV listing status changed.'
+                );
+            }
+        }
+
+        if (current.nvd) {
+
+            if (!previous.nvd) {
+
+                changes.push(
+                    'NVD information became available.'
+                );
+
+            } else {
+
+                if (
+                    current.nvd.modified !==
+                    previous.nvd.modified
+                ) {
+                    changes.push(
+                        'NVD record modification date changed.'
+                    );
+                }
+
+                if (
+                    current.nvd.score !==
+                    previous.nvd.score
+                ) {
+                    changes.push(
+                        'NVD CVSS score changed.'
+                    );
+                }
+
+                if (
+                    current.nvd.severity !==
+                    previous.nvd.severity
+                ) {
+                    changes.push(
+                        'NVD severity changed.'
+                    );
+                }
+            }
+        }
+
+        if (current.epss) {
+
+            if (!previous.epss) {
+
+                changes.push(
+                    'FIRST EPSS information became available.'
+                );
+
+            } else {
+
+                var oldScore =
+                    previous.epss.probability;
+
+                var newScore =
+                    current.epss.probability;
+
+                if (
+                    oldScore !== null &amp;&amp;
+                    oldScore !== undefined &amp;&amp;
+                    newScore !== null &amp;&amp;
+                    newScore !== undefined
+                ) {
+
+                    if (
+                        Math.abs(newScore - oldScore)
+                        >= 0.005
+                    ) {
+
+                        changes.push(
+                            'EPSS probability changed from ' +
+                            (oldScore * 100).toFixed(2) +
+                            '% to ' +
+                            (newScore * 100).toFixed(2) +
+                            '%.'
+                        );
+                    }
+                }
+            }
+        }
+
+        return changes;
+    }
+
+    /*
+     * Material-change signature.
+     *
+     * Retrieval timestamps are excluded to prevent
+     * duplicate revisions from unchanged lookups.
+     */
+
+    function signature(payload) {
+
+        if (!payload) {
+            return '';
+        }
+
+        var intel = payload.intelligence || {};
+        var epssBucket = null;
+
+        if (intel.epss) {
+
+            if (
+                intel.epss.probability !== null &amp;&amp;
+                intel.epss.probability !== undefined
+            ) {
+
+                epssBucket = Math.round(
+                    intel.epss.probability * 200
+                );
+            }
+        }
+
+        return JSON.stringify({
+
+            inputs: payload.inputs,
+            decision: payload.decision,
+            evidence: payload.evidence,
+
+            nvd: intel.nvd
+                ? {
+                    found: intel.nvd.found,
+                    modified: intel.nvd.modified,
+                    score: intel.nvd.score,
+                    severity: intel.nvd.severity
+                }
+                : null,
+
+            kev: intel.kev
+                ? {
+                    listed: intel.kev.listed,
+                    dateAdded: intel.kev.dateAdded
+                }
+                : null,
+
+            epssBucket: epssBucket
+        });
+    }
+
+    try {
+
+        if (!/^[0-9a-f]{32}$/i.test(incidentId)) {
+
+            return {
+                success: false,
+                message:
+                    'Missing or invalid Incident identifier.'
+            };
+        }
+
+        var incident =
+            new GlideRecordSecure('incident');
+
+        if (!incident.get(incidentId)) {
+
+            return {
+                success: false,
+                message:
+                    'Incident not found or access denied.'
+            };
+        }
+
+        var probe =
+            new GlideRecordSecure(TABLE);
+
+        if (!probe.isValid()) {
+
+            return {
+                success: false,
+                message:
+                    'Assessment table is unavailable.'
+            };
+        }
+
+        if (
+            !probe.isValidField('incident') ||
+            !probe.isValidField('cve') ||
+            !probe.isValidField('recommendation')
+        ) {
+
+            return {
+                success: false,
+                message:
+                    'Assessment table fields are missing.'
+            };
+        }
+
+        /*
+         * Load existing version-2 revisions.
+         *
+         * Older CMDB snapshots, if present, are
+         * ignored rather than copied forward.
+         */
+
+        var history = [];
+        var latest = null;
+
+        var records =
+            new GlideRecordSecure(TABLE);
+
+        records.addQuery(
+            'incident',
+            incidentId
+        );
+
+        records.orderByDesc('sys_created_on');
+        records.orderByDesc('sys_id');
+        records.setLimit(100);
+        records.query();
+
+        while (records.next()) {
+
+            var saved = null;
+
+            try {
+
+                saved = JSON.parse(
+                    str(
+                        records.getValue(
+                            'recommendation'
+                        )
+                    )
+                );
+
+            } catch (ignore) {
+                continue;
+            }
+
+            if (!saved || saved.version !== 2) {
+                continue;
+            }
+
+            var entry = {
+                revision:
+                    Number(saved.revision) || 0,
+
+                cve: str(
+                    records.getValue('cve')
+                ),
+
+                created: str(
+                    records.getDisplayValue(
+                        'sys_created_on'
+                    )
+                ),
+
+                author: str(
+                    records.getValue(
+                        'sys_created_by'
+                    )
+                ),
+
+                inputs: saved.inputs,
+                decision: saved.decision,
+                intelligence: saved.intelligence,
+                evidence: cleanEvidence(saved.evidence)
+            };
+
+            history.push(entry);
+
+            if (!latest) {
+                latest = entry;
+            }
+        }
+
+        var inputs = latest
+            ? latest.inputs || emptyInputs()
+            : emptyInputs();
+
+        if (action !== '') {
+            inputs = requestInputs();
+        }
+
+        var evidence = latest
+            ? cleanEvidence(latest.evidence)
+            : cleanEvidence(null);
+
+        if (action !== '') {
+            evidence = postedEvidence(evidence);
+        }
+
+        var investigationQuery = short(
+            clean(RP.getParameterValue('sysparm_uia_investigation_query')),
+            100
+        );
+        var knowledgeResults = action === 'investigate'
+            ? searchKnowledge(investigationQuery)
+            : [];
+
+        var previousIntel = latest
+            ? latest.intelligence || null
+            : null;
+
+        if (
+            previousIntel &amp;&amp;
+            previousIntel.cve !== inputs.cve
+        ) {
+            previousIntel = null;
+        }
+
+        var intel = previousIntel;
+
+        if (
+            action === 'save' ||
+            action === 'assess'
+        ) {
+
+            var formIntel = submittedIntel(
+                inputs.cve
+            );
+
+            if (formIntel) {
+                intel = formIntel;
+            }
+        }
+
+        /*
+         * Refresh is the only action that calls
+         * external intelligence services.
+         */
+
+        if (action === 'refresh') {
+
+            if (!inputs.cve) {
+
+                message =
+                    'Enter a CVE before checking updates.';
+
+                isError = true;
+
+            } else {
+
+                var fetched = lookup(
+                    inputs.cve,
+                    previousIntel
+                );
+
+                intel = fetched.intelligence;
+
+                differences = compareIntel(
+                    previousIntel,
+                    intel
+                );
+
+                /*
+                 * Conservative SSVC automation.
+                 *
+                 * Only a freshly retrieved, valid
+                 * CISA KEV catalog can trigger
+                 * the automatic change.
+                 *
+                 * Any manually selected non-unknown
+                 * value is preserved.
+                 */
+
+                if (
+                    fetched.freshKev &amp;&amp;
+                    intel.kev &amp;&amp;
+                    intel.kev.listed === true &amp;&amp;
+                    inputs.exploitation === 'unknown'
+                ) {
+
+                    inputs.exploitation = 'active';
+                    autoApplied = true;
+
+                    message =
+                        'CISA KEV confirms known exploitation. ' +
+                        'Exploitation was prefilled as Active. ' +
+                        'Review the suggestion before saving.';
+
+                    activeTab = 'ssvc';
+
+                } else {
+
+                    message =
+                        'Intelligence refreshed. ' +
+                        'Review the evidence before saving.';
+                }
+            }
+        }
+
+        /*
+         * Existing SSVC and Incident IUP logic.
+         *
+         * No changes to UIARiskService.
+         */
+
+        var plan =
+            new UIARiskService().assess(
+                incidentId,
+                inputs
+            );
+
+        if (!plan) {
+
+            return {
+                success: false,
+                message:
+                    'UIARiskService returned no assessment.'
+            };
+        }
+
+        if (!plan.success) {
+            return plan;
+        }
+
+        /*
+         * Persist only material assessment changes.
+         */
+
+        if (action === 'save') {
+
+            var payload = {
+                version: 2,
+
+                revision: latest
+                    ? latest.revision + 1
+                    : 1,
+
+                inputs: {
+                    cve: plan.context.cve,
+                    applicability:
+                        plan.context.applicability,
+                    exploitation:
+                        plan.context.exploitation,
+                    exposure:
+                        plan.context.exposure,
+                    automatable:
+                        plan.context.automatable,
+                    valueDensity:
+                        plan.context.valueDensity,
+                    safety:
+                        plan.context.safety,
+                    mission:
+                        plan.context.mission,
+                    patch:
+                        plan.context.patch
+                },
+
+                decision: {
+                    priority:
+                        plan.decision.priority,
+                    title:
+                        plan.decision.title,
+                    incomplete:
+                        plan.decision.incomplete
+                },
+
+                intelligence:
+                    compactIntel(intel),
+                evidence: evidence
+            };
+
+            var oldPayload = latest
+                ? {
+                    inputs: latest.inputs,
+                    decision: latest.decision,
+                    intelligence:
+                        latest.intelligence,
+                    evidence: latest.evidence
+                }
+                : null;
+
+            if (
+                oldPayload &amp;&amp;
+                signature(oldPayload) ===
+                signature(payload)
+            ) {
+
+                message =
+                    'No material changes detected. ' +
+                    'Existing revision retained.';
+
+            } else {
+
+                var serialized =
+                    JSON.stringify(payload);
+
+                if (serialized.length > 4000) {
+
+                    if (payload.intelligence) {
+
+                        if (payload.intelligence.nvd) {
+
+                            payload.intelligence.nvd
+                                .references = [];
+
+                            payload.intelligence.nvd
+                                .description = '';
+                        }
+
+                        if (payload.intelligence.kev) {
+
+                            payload.intelligence.kev
+                                .requiredAction = '';
+                        }
+
+                        payload.intelligence.errors = [];
+                    }
+
+                    serialized =
+                        JSON.stringify(payload);
+                }
+
+                if (serialized.length > 4000) {
+
+                    message =
+                        'Assessment exceeds the ' +
+                        '4,000-character Recommendation ' +
+                        'field limit. Nothing was saved.';
+
+                    isError = true;
+
+                } else {
+
+                    var toSave =
+                        new GlideRecordSecure(TABLE);
+
+                    toSave.initialize();
+
+                    if (!toSave.canCreate()) {
+
+                        message =
+                            'Save denied by table permissions.';
+
+                        isError = true;
+
+                    } else {
+
+                        toSave.setValue(
+                            'incident',
+                            incidentId
+                        );
+
+                        toSave.setValue(
+                            'cve',
+                            payload.inputs.cve
+                        );
+
+                        toSave.setValue(
+                            'recommendation',
+                            serialized
+                        );
+
+                        var insertedId =
+                            toSave.insert();
+
+                        if (insertedId) {
+
+                            message =
+                                'Assessment saved as revision ' +
+                                payload.revision + '.';
+
+                            var newEntry = {
+                                revision:
+                                    payload.revision,
+                                cve:
+                                    payload.inputs.cve,
+                                created:
+                                    new GlideDateTime()
+                                        .getDisplayValue(),
+                                author:
+                                    str(gs.getUserName()),
+                                inputs:
+                                    payload.inputs,
+                                decision:
+                                    payload.decision,
+                                intelligence:
+                                    payload.intelligence,
+                                evidence:
+                                    payload.evidence
+                            };
+
+                            history.unshift(newEntry);
+                            latest = newEntry;
+
+                        } else {
+
+                            message =
+                                'Assessment insert failed. ' +
+                                'Check ACLs and system logs.';
+
+                            isError = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        var visibleHistory = [];
+
+        for (
+            var h = 0;
+            h !== history.length;
+            h++
+        ) {
+
+            visibleHistory.push({
+                revision: history[h].revision,
+                created: history[h].created,
+                author: history[h].author,
+                cve: history[h].cve,
+                decision: history[h].decision
+            });
+        }
+
+        var kevListed =
+            !!(
+                intel &amp;&amp;
+                intel.kev &amp;&amp;
+                intel.kev.listed === true
+            );
+
+        var exploitation =
+            str(plan.context.exploitation);
+
+        plan.intelligence = intel;
+        plan.evidence = evidence;
+        plan.investigationQuery = investigationQuery;
+        plan.knowledgeResults = knowledgeResults;
+        plan.history = visibleHistory;
+
+        plan.latestRevision = latest
+            ? latest.revision
+            : 0;
+
+        plan.latestSavedAt = latest
+            ? latest.created
+            : '';
+
+        plan.statusMessage = message;
+        plan.statusError = isError;
+        plan.differences = differences;
+
+        plan.activeTab = activeTab;
+
+        plan.suggestions = {
+            exploitation: {
+                kevListed: kevListed,
+                autoApplied: autoApplied,
+
+                conflict:
+                    kevListed &amp;&amp;
+                    exploitation !== 'active' &amp;&amp;
+                    exploitation !== 'unknown',
+
+                source: 'CISA KEV',
+
+                explanation:
+                    'A CISA KEV listing provides evidence ' +
+                    'of exploitation in the wild. ' +
+                    'It does not prove that this local ' +
+                    'installation is vulnerable.'
+            }
+        };
+
+        return plan;
+
+    } catch (error) {
+
+        gs.error(
+            'UIA Patch Assessment: ' +
+            str(error.message || error)
+        );
+
+        return {
+            success: false,
+            message:
+                'Server-side assessment error: ' +
+                str(error.message || error)
+        };
+    }
+
+})();
+
+JSON.stringify(uiaResult)
+    .replace(/\x3c/g, '\\u003c')
+    .replace(/\x26/g, '\\u0026')
+    .replace(/\x3e/g, '\\u003e');
+
+</g:evaluate>
+
+<style type="text/css">
+
+/* ========================================
+   UIA DESIGN SYSTEM
+   ======================================== */
+
+.uia-app {
+    --uia-bg: #f5f7fb;
+    --uia-surface: #ffffff;
+    --uia-text: #172334;
+    --uia-muted: #64748b;
+    --uia-border: #e1e7ef;
+    --uia-blue: #2563eb;
+    --uia-blue-light: #eff6ff;
+    --uia-green: #15803d;
+    --uia-green-light: #f0fdf4;
+    --uia-amber: #a16207;
+    --uia-amber-light: #fffbeb;
+    --uia-red: #b91c1c;
+    --uia-red-light: #fef2f2;
+
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 24px;
+    color: var(--uia-text);
+    font-family:
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        Arial,
+        sans-serif;
+    font-size: 14px;
+    line-height: 1.55;
+}
+
+.uia-app *,
+.uia-app *:before,
+.uia-app *:after {
+    box-sizing: border-box;
+}
+
+.uia-app h1,
+.uia-app h2,
+.uia-app h3,
+.uia-app h4 {
+    color: var(--uia-text);
+    line-height: 1.3;
+}
+
+.uia-app h1 {
+    font-size: 25px;
+    margin: 0;
+    font-weight: 700;
+}
+
+.uia-app h2 {
+    font-size: 19px;
+    margin: 0 0 14px;
+}
+
+.uia-app h3 {
+    font-size: 16px;
+    margin: 0 0 10px;
+}
+
+.uia-app h4 {
+    font-size: 14px;
+    margin: 0 0 8px;
+}
+
+.uia-muted {
+    color: var(--uia-muted);
+}
+
+.uia-small {
+    font-size: 12px;
+}
+
+.uia-hidden {
+    display: none !important;
+}
+
+/* ========================================
+   HEADER AND STICKY ACTIONS
+   ======================================== */
+
+.uia-header {
+    background: var(--uia-surface);
+    border: 1px solid var(--uia-border);
+    border-radius: 14px;
+    padding: 23px;
+    margin-bottom: 16px;
+}
+
+.uia-header-main {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+}
+
+.uia-brand {
+    display: flex;
+    gap: 14px;
+    align-items: center;
+}
+
+.uia-brand-icon {
+    width: 48px;
+    height: 48px;
+    border-radius: 12px;
+    background: var(--uia-blue-light);
+    color: var(--uia-blue);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 25px;
+    font-weight: bold;
+}
+
+.uia-header-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 9px;
+    margin-top: 15px;
+}
+
+.uia-toolbar {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    background: rgba(255,255,255,0.97);
+    border: 1px solid var(--uia-border);
+    border-radius: 12px;
+    box-shadow: 0 4px 16px rgba(20,35,55,0.07);
+}
+
+.uia-toolbar-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+/* ========================================
+   BUTTONS AND BADGES
+   ======================================== */
+
+.uia-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    padding: 10px 15px;
+    border-radius: 8px;
+    border: 1px solid #cbd5e1;
+    background: white;
+    color: #334155;
+    font: inherit;
+    font-weight: 600;
+    font-size: 13px;
+    cursor: pointer;
+    text-decoration: none;
+    transition: background 0.15s ease;
+}
+
+.uia-btn:hover {
+    background: #f1f5f9;
+}
+
+.uia-btn-primary {
+    background: var(--uia-blue);
+    border-color: var(--uia-blue);
+    color: white;
+}
+
+.uia-btn-primary:hover {
+    background: #1d4ed8;
+    color: white;
+}
+
+.uia-btn-soft {
+    background: var(--uia-blue-light);
+    border-color: #bfdbfe;
+    color: #1d4ed8;
+}
+
+.uia-btn-soft:hover {
+    background: #dbeafe;
+}
+
+.uia-badge {
+    display: inline-block;
+    padding: 4px 9px;
+    border-radius: 999px;
+    background: #f1f5f9;
+    color: #475569;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.5;
+    white-space: nowrap;
+}
+
+.uia-badge-blue {
+    background: var(--uia-blue-light);
+    color: #1d4ed8;
+}
+
+.uia-badge-green {
+    background: var(--uia-green-light);
+    color: var(--uia-green);
+}
+
+.uia-badge-amber {
+    background: var(--uia-amber-light);
+    color: var(--uia-amber);
+}
+
+.uia-badge-red {
+    background: var(--uia-red-light);
+    color: var(--uia-red);
+}
+
+/* ========================================
+   NAVIGATION
+   ======================================== */
+
+.uia-tabs {
+    display: flex;
+    gap: 5px;
+    overflow-x: auto;
+    padding: 6px;
+    margin-bottom: 18px;
+    border: 1px solid var(--uia-border);
+    border-radius: 12px;
+    background: #ffffff;
+}
+
+.uia-tab {
+    flex: 1 0 auto;
+    border: 0;
+    border-radius: 8px;
+    padding: 12px 15px;
+    background: transparent;
+    color: #64748b;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.uia-tab:hover {
+    background: #f1f5f9;
+}
+
+.uia-tab.uia-active {
+    background: var(--uia-blue);
+    color: white;
+}
+
+.uia-view[hidden] {
+    display: none !important;
+}
+
+/* ========================================
+   PANELS AND METRICS
+   ======================================== */
+
+.uia-panel {
+    background: var(--uia-surface);
+    border: 1px solid var(--uia-border);
+    border-radius: 12px;
+    padding: 22px;
+    margin-bottom: 16px;
+}
+
+.uia-section-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 15px;
+}
+
+.uia-section-heading h2,
+.uia-section-heading h3 {
+    margin: 0;
+}
+
+.uia-metrics {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 14px;
+    margin-bottom: 16px;
+}
+
+.uia-metric {
+    padding: 18px;
+    border: 1px solid var(--uia-border);
+    border-radius: 12px;
+    background: white;
+    min-width: 0;
+}
+
+.uia-metric-label {
+    color: var(--uia-muted);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.uia-metric-value {
+    font-size: 28px;
+    font-weight: 750;
+    margin: 10px 0 3px;
+    overflow-wrap: anywhere;
+}
+
+.uia-metric-sub {
+    font-size: 12px;
+    color: var(--uia-muted);
+}
+
+.uia-two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+}
+
+.uia-progress-track {
+    width: 100%;
+    height: 9px;
+    overflow: hidden;
+    border-radius: 99px;
+    background: #e2e8f0;
+    margin: 14px 0 9px;
+}
+
+.uia-progress-fill {
+    width: 0;
+    height: 100%;
+    background: var(--uia-blue);
+    border-radius: 99px;
+    transition: width 0.2s ease;
+}
+
+/* ========================================
+   STATUS MESSAGES
+   ======================================== */
+
+.uia-notice {
+    padding: 13px 15px;
+    border-radius: 9px;
+    border: 1px solid #dbeafe;
+    background: var(--uia-blue-light);
+    color: #1e40af;
+    margin-bottom: 16px;
+}
+
+.uia-notice-success {
+    background: var(--uia-green-light);
+    border-color: #bbf7d0;
+    color: #166534;
+}
+
+.uia-notice-warning {
+    background: var(--uia-amber-light);
+    border-color: #fde68a;
+    color: #92400e;
+}
+
+.uia-notice-error {
+    background: var(--uia-red-light);
+    border-color: #fecaca;
+    color: #991b1b;
+}
+
+.uia-attention-list {
+    display: grid;
+    gap: 10px;
+}
+
+.uia-attention-item {
+    display: flex;
+    gap: 12px;
+    padding: 13px;
+    border: 1px solid var(--uia-border);
+    border-radius: 9px;
+    background: #ffffff;
+}
+
+.uia-attention-icon {
+    flex: 0 0 28px;
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    background: #f1f5f9;
+    color: #475569;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: bold;
+}
+
+/* ========================================
+   DATA AND INTELLIGENCE
+   ======================================== */
+
+.uia-data-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 15px;
+    padding: 10px 0;
+    border-bottom: 1px solid #edf1f5;
+}
+
+.uia-data-row:last-child {
+    border-bottom: 0;
+}
+
+.uia-data-row strong {
+    font-size: 13px;
+}
+
+.uia-data-row span {
+    text-align: right;
+    overflow-wrap: anywhere;
+}
+
+.uia-source-card {
+    border: 1px solid var(--uia-border);
+    border-radius: 11px;
+    padding: 19px;
+    margin-bottom: 14px;
+}
+
+.uia-source-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 14px;
+}
+
+.uia-source-top h3 {
+    margin-bottom: 4px;
+}
+
+.uia-details {
+    margin-top: 13px;
+    padding-top: 12px;
+    border-top: 1px solid var(--uia-border);
+}
+
+.uia-details summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--uia-blue);
+    padding: 6px 0;
+}
+
+.uia-details-body {
+    padding: 12px 0;
+    color: #334155;
+    overflow-wrap: anywhere;
+}
+
+.uia-details-body a {
+    color: #1d4ed8;
+    overflow-wrap: anywhere;
+}
+
+/* ========================================
+   SSVC INPUT CARDS
+   ======================================== */
+
+.uia-input-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 13px;
+}
+
+.uia-input-card {
+    border: 1px solid var(--uia-border);
+    border-radius: 10px;
+    padding: 17px;
+    background: #ffffff;
+    min-width: 0;
+}
+
+.uia-input-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 11px;
+}
+
+.uia-input-card label {
+    font-weight: 700;
+    font-size: 13px;
+}
+
+.uia-input-card select,
+.uia-input-card input,
+.uia-cve-input {
+    width: 100%;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    padding: 11px 12px;
+    background: #ffffff;
+    color: #172334;
+    font: inherit;
+    font-size: 13px;
+}
+
+.uia-input-help {
+    color: var(--uia-muted);
+    font-size: 12px;
+    margin: 10px 0 0;
+}
+
+.uia-input-card select:focus,
+.uia-cve-input:focus {
+    outline: 2px solid #bfdbfe;
+    border-color: var(--uia-blue);
+}
+
+.uia-group-heading {
+    margin: 23px 0 12px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--uia-border);
+}
+
+.uia-group-heading:first-child {
+    margin-top: 0;
+}
+
+/* ========================================
+   ACTION PLAN
+   ======================================== */
+
+.uia-guide-switch {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 18px;
+}
+
+.uia-step {
+    display: flex;
+    gap: 15px;
+    padding: 18px;
+    margin-bottom: 12px;
+    border: 1px solid var(--uia-border);
+    border-radius: 10px;
+    background: white;
+}
+
+.uia-step-number {
+    flex: 0 0 36px;
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    background: var(--uia-blue-light);
+    color: var(--uia-blue);
+    font-size: 16px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.uia-step-content {
+    flex: 1;
+    min-width: 0;
+}
+
+.uia-step-action {
+    font-weight: 600;
+    margin: 8px 0;
+}
+
+.uia-step-role {
+    color: var(--uia-muted);
+    font-size: 12px;
+}
+
+/* ========================================
+   HISTORY
+   ======================================== */
+
+.uia-table-scroll {
+    width: 100%;
+    overflow-x: auto;
+}
+
+.uia-history {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.uia-history th,
+.uia-history td {
+    text-align: left;
+    padding: 13px 12px;
+    border-bottom: 1px solid var(--uia-border);
+    font-size: 13px;
+}
+
+.uia-history th {
+    background: #f8fafc;
+    color: #475569;
+    font-weight: 700;
+}
+
+.uia-history tr:last-child td {
+    border-bottom: 0;
+}
+
+/* ========================================
+   RESPONSIVE
+   ======================================== */
+
+@media (max-width: 950px) {
+
+    .uia-metrics {
+        grid-template-columns:
+            repeat(2, minmax(0, 1fr));
+    }
+
+    .uia-two-col {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 650px) {
+
+    .uia-app {
+        padding: 12px;
+    }
+
+    .uia-header,
+    .uia-panel {
+        padding: 16px;
+    }
+
+    .uia-input-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .uia-toolbar {
+        position: static;
+    }
+
+    .uia-toolbar-actions {
+        width: 100%;
+    }
+
+    .uia-toolbar-actions .uia-btn {
+        flex: 1;
+    }
+
+    .uia-metric {
+        padding: 13px;
+    }
+
+    .uia-metric-value {
+        font-size: 23px;
+    }
+
+    .uia-tab {
+        flex: 0 0 auto;
+    }
+
+    .uia-data-row {
+        flex-direction: column;
+        gap: 3px;
+    }
+
+    .uia-data-row span {
+        text-align: left;
+    }
+}
+
+
+/* Technical Investigation layout */
+
+#uia-view-investigation .uia-panel > label {
+    display: block;
+    width: 100%;
+    margin: 16px 0 8px;
+    font-weight: 700;
+    font-size: 13px;
+}
+
+#uia-view-investigation textarea,
+#uia-view-investigation .uia-evidence-url,
+#uia-view-investigation .uia-evidence-comment {
+    display: block;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    padding: 12px 14px;
+    background: white;
+    color: #172334;
+    font: inherit;
+    font-size: 14px;
+    line-height: 1.5;
+}
+
+#uia-view-investigation textarea {
+    min-height: 112px;
+    resize: vertical;
+}
+
+#uia-view-investigation #uia-evidence-notes {
+    min-height: 150px;
+}
+
+#uia-view-investigation .uia-evidence-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr)
+                           minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: center;
+    margin: 10px 0;
+}
+
+@media (max-width: 650px) {
+    #uia-view-investigation .uia-evidence-row {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}
+
+</style>
+
+<div class="uia-app" id="uia-app">
+
+    <form method="post"
+          id="uia-form"
+          action="x_2280382_uiasyste_patch_plan.do">
+
+        <input type="hidden"
+               id="uia-incident-id"
+               name="sysparm_incident_id" />
+
+        <input type="hidden"
+               id="uia-intel-hidden"
+               name="sysparm_uia_intelligence" />
+
+        <input type="hidden"
+               id="uia-active-tab"
+               name="sysparm_uia_tab"
+               value="overview" />
+
+        <!-- HEADER -->
+
+        <header class="uia-header">
+
+            <div class="uia-header-main">
+
+                <div class="uia-brand">
+
+                    <div class="uia-brand-icon">
+                        &#x25C8;
+                    </div>
+
+                    <div>
+
+                        <h1>Patch &amp; Mitigation</h1>
+
+                        <div class="uia-muted uia-small">
+                            Vulnerability assessment workspace
+                        </div>
+
+                    </div>
+
+                </div>
+
+                <span class="uia-badge"
+                      id="uia-revision-badge">
+                    Not saved
+                </span>
+
+            </div>
+
+            <div class="uia-header-meta">
+
+                <span class="uia-badge uia-badge-blue"
+                      id="uia-incident-badge">
+                    Incident
+                </span>
+
+                <span class="uia-badge"
+                      id="uia-cve-badge">
+                    No CVE
+                </span>
+
+                <span class="uia-muted uia-small"
+                      id="uia-last-saved">
+                </span>
+
+            </div>
+
+        </header>
+
+        <!-- STICKY TOOLBAR -->
+
+        <div class="uia-toolbar">
+
+            <span class="uia-muted uia-small"
+                  id="uia-toolbar-status">
+                Assessment workspace
+            </span>
+
+            <div class="uia-toolbar-actions">
+
+                <button class="uia-btn uia-btn-soft"
+                        type="submit"
+                        name="sysparm_uia_action"
+                        value="refresh">
+                    &#x21BB; Check for Updates
+                </button>
+
+                <button class="uia-btn uia-btn-primary"
+                        type="submit"
+                        name="sysparm_uia_action"
+                        value="save">
+                    Save Assessment
+                </button>
+
+                <button class="uia-btn"
+                        type="button"
+                        id="uia-return">
+                    Return to Incident
+                </button>
+
+            </div>
+
+        </div>
+
+        <div id="uia-status"></div>
+
+        <div id="uia-dirty-message"
+             class="uia-notice uia-notice-warning uia-hidden">
+            Assessment inputs have changed.
+            Recalculate SSVC or save to update the decision.
+        </div>
+
+        <!-- TABS -->
+
+        <nav class="uia-tabs"
+             role="tablist"
+             aria-label="Assessment sections">
+
+            <button type="button"
+                    class="uia-tab uia-active"
+                    data-tab="overview">
+                Overview
+            </button>
+
+            <button type="button"
+                    class="uia-tab"
+                    data-tab="intelligence">
+                Intelligence
+            </button>
+
+            <button type="button"
+                    class="uia-tab"
+                    data-tab="ssvc">
+                SSVC Assessment
+            </button>
+
+            <button type="button"
+                    class="uia-tab"
+                    data-tab="plan">
+                Action Plan
+            </button>
+
+            <button type="button"
+                    class="uia-tab"
+                    data-tab="investigation">
+                Technical Investigation
+            </button>
+
+            <button type="button"
+                    class="uia-tab"
+                    data-tab="history">
+                History
+            </button>
+
+        </nav>
+
+        <!-- ====================================
+             OVERVIEW
+             ==================================== -->
+
+        <section class="uia-view"
+                 id="uia-view-overview">
+
+            <div class="uia-metrics">
+
+                <div class="uia-metric">
+
+                    <div class="uia-metric-label">
+                        SSVC decision
+                    </div>
+
+                    <div class="uia-metric-value"
+                         id="uia-metric-ssvc">
+                        -
+                    </div>
+
+                    <div class="uia-metric-sub"
+                         id="uia-metric-ssvc-sub">
+                        Recommended response
+                    </div>
+
+                </div>
+
+                <div class="uia-metric">
+
+                    <div class="uia-metric-label">
+                        Incident priority
+                    </div>
+
+                    <div class="uia-metric-value"
+                         id="uia-metric-priority">
+                        -
+                    </div>
+
+                    <div class="uia-metric-sub">
+                        ServiceNow IUP
+                    </div>
+
+                </div>
+
+                <div class="uia-metric">
+
+                    <div class="uia-metric-label">
+                        CVSS score
+                    </div>
+
+                    <div class="uia-metric-value"
+                         id="uia-metric-cvss">
+                        -
+                    </div>
+
+                    <div class="uia-metric-sub"
+                         id="uia-metric-severity">
+                        NVD intelligence
+                    </div>
+
+                </div>
+
+                <div class="uia-metric">
+
+                    <div class="uia-metric-label">
+                        CISA KEV
+                    </div>
+
+                    <div class="uia-metric-value"
+                         id="uia-metric-kev">
+                        -
+                    </div>
+
+                    <div class="uia-metric-sub">
+                        Known exploitation catalog
+                    </div>
+
+                </div>
+
+            </div>
+
+            <div class="uia-two-col">
+
+                <div class="uia-panel">
+
+                    <div class="uia-section-heading">
+
+                        <h2>Assessment completeness</h2>
+
+                        <span class="uia-badge"
+                              id="uia-completeness-badge">
+                            0 / 8
+                        </span>
+
+                    </div>
+
+                    <div class="uia-progress-track">
+
+                        <div class="uia-progress-fill"
+                             id="uia-progress-fill">
+                        </div>
+
+                    </div>
+
+                    <p class="uia-muted uia-small"
+                       id="uia-completeness-text">
+                    </p>
+
+                    <p class="uia-muted uia-small">
+                        This counts populated assessment
+                        inputs, including automated suggestions.
+                        It does not establish that the evidence
+                        has been independently verified.
+                    </p>
+
+                </div>
+
+                <div class="uia-panel">
+
+                    <h2>Current recommendation</h2>
+
+                    <h3 id="uia-decision-title">
+                        Assessment pending
+                    </h3>
+
+                    <p id="uia-decision-summary"></p>
+
+                    <div id="uia-decision-warning"></div>
+
+                </div>
+
+            </div>
+
+            <div class="uia-panel">
+
+                <div class="uia-section-heading">
+
+                    <h2>What needs attention?</h2>
+
+                    <span class="uia-badge">
+                        Review checklist
+                    </span>
+
+                </div>
+
+                <div class="uia-attention-list"
+                     id="uia-attention-list">
+                </div>
+
+            </div>
+
+            <div class="uia-two-col">
+
+                <div class="uia-panel">
+
+                    <h2>Incident context</h2>
+
+                    <div id="uia-incident-context"></div>
+
+                </div>
+
+                <div class="uia-panel">
+
+                    <h2>Latest assessment</h2>
+
+                    <div id="uia-saved-summary"></div>
+
+                    <div style="margin-top:16px;">
+
+                        <button class="uia-btn"
+                                type="button"
+                                id="uia-overview-history">
+                            View revision history
+                        </button>
+
+                    </div>
+
+                </div>
+
+            </div>
+
+        </section>
+
+        <!-- ====================================
+             INTELLIGENCE
+             ==================================== -->
+
+        <section class="uia-view"
+                 id="uia-view-intelligence"
+                 hidden="hidden">
+
+            <div class="uia-panel">
+
+                <div class="uia-section-heading">
+
+                    <div>
+
+                        <h2>Vulnerability intelligence</h2>
+
+                        <p class="uia-muted uia-small">
+                            Read-only public vulnerability
+                            intelligence with source status.
+                        </p>
+
+                    </div>
+
+                    <span class="uia-badge">
+                        NVD / CISA / FIRST
+                    </span>
+
+                </div>
+
+                <div class="uia-input-card">
+
+                    <label for="uia-cve">
+                        CVE identifier
+                    </label>
+
+                    <div style="margin-top:9px;">
+
+                        <input class="uia-cve-input"
+                               id="uia-cve"
+                               name="sysparm_uia_cve"
+                               data-field="cve"
+                               placeholder="CVE-2024-3400" />
+
+                    </div>
+
+                    <p class="uia-input-help">
+                        Enter a CVE and select Check for Updates
+                        to retrieve the latest available evidence.
+                    </p>
+
+                </div>
+
+                <div style="margin-top:15px;">
+
+                    <button class="uia-btn uia-btn-primary"
+                            type="submit"
+                            name="sysparm_uia_action"
+                            value="refresh">
+                        Check for Updates
+                    </button>
+
+                </div>
+
+                <div id="uia-intel-meta"
+                     class="uia-muted uia-small"
+                     style="margin-top:12px;">
+                </div>
+
+            </div>
+
+            <div id="uia-intel-sources"></div>
+
+            <div class="uia-panel">
+
+                <h2>Changes since saved assessment</h2>
+
+                <div id="uia-intel-differences"></div>
+
+            </div>
+
+            <div class="uia-panel">
+
+                <h2>Evidence limitations</h2>
+
+                <p class="uia-muted">
+                    NVD CVSS does not establish local
+                    reachability or SSVC Automatable.
+                    FIRST EPSS predicts exploitation
+                    probability and does not prove
+                    exploitation in the wild.
+                    CISA KEV establishes known exploitation
+                    but does not prove that your particular
+                    installation is affected.
+                </p>
+
+            </div>
+
+        </section>
+
+        <!-- ====================================
+             SSVC
+             ==================================== -->
+
+        <section class="uia-view"
+                 id="uia-view-ssvc"
+                 hidden="hidden">
+
+            <div class="uia-panel">
+
+                <div class="uia-section-heading">
+
+                    <div>
+
+                        <h2>SSVC decision assessment</h2>
+
+                        <p class="uia-muted uia-small">
+                            Evidence-based inputs for the
+                            existing SSVC decision tree.
+                        </p>
+
+                    </div>
+
+                    <span class="uia-badge uia-badge-blue">
+                        Deployer SSVC
+                    </span>
+
+                </div>
+
+                <div id="uia-suggestion-panel"></div>
+
+                <div class="uia-group-heading">
+
+                    <h3>1. Vulnerability and exploitation</h3>
+
+                    <p class="uia-muted uia-small">
+                        Confirm whether the vulnerability
+                        applies and what exploitation evidence
+                        is available.
+                    </p>
+
+                </div>
+
+                <div class="uia-input-grid">
+
+                    <div class="uia-input-card">
+
+                        <div class="uia-input-card-head">
+
+                            <label for="uia-applicability">
+                                Affected version
+                            </label>
+
+                            <span class="uia-badge"
+                                  data-status-for="applicability">
+                                Unknown
+                            </span>
+
+                        </div>
+
+                        <select id="uia-applicability"
+                                name="sysparm_uia_applicability"
+                                data-field="applicability">
+
+                            <option value="unknown">
+                                Not verified
+                            </option>
+
+                            <option value="affected">
+                                Yes - affected
+                            </option>
+
+                            <option value="not_affected">
+                                Verified not affected
+                            </option>
+
+                        </select>
+
+                        <p class="uia-input-help">
+                            Requires local product and version
+                            verification. NVD alone cannot
+                            confirm your installation.
+                        </p>
+
+                    </div>
+
+                    <div class="uia-input-card">
+
+                        <div class="uia-input-card-head">
+
+                            <label for="uia-exploitation">
+                                Exploitation
+                            </label>
+
+                            <span class="uia-badge"
+                                  data-status-for="exploitation">
+                                Unknown
+                            </span>
+
+                        </div>
+
+                        <select id="uia-exploitation"
+                                name="sysparm_uia_exploitation"
+                                data-field="exploitation">
+
+                            <option value="unknown">
+                                Unknown / not investigated
+                            </option>
+
+                            <option value="none">
+                                None found after investigation
+                            </option>
+
+                            <option value="poc">
+                                Public proof of concept
+                            </option>
+
+                            <option value="active">
+                                Active exploitation in the wild
+                            </option>
+
+                        </select>
+
+                        <p class="uia-input-help">
+                            A freshly confirmed CISA KEV
+                            listing can automatically prefill
+                            Active when this field is Unknown.
+                            Manual selections are preserved.
+                        </p>
+
+                    </div>
+
+                    <div class="uia-input-card">
+
+                        <div class="uia-input-card-head">
+
+                            <label for="uia-exposure">
+                                System exposure
+                            </label>
+
+                            <span class="uia-badge"
+                                  data-status-for="exposure">
+                                Unknown
+                            </span>
+
+                        </div>
+
+                        <select id="uia-exposure"
+                                name="sysparm_uia_exposure"
+                                data-field="exposure">
+
+                            <option value="unknown">
+                                Not verified
+                            </option>
+
+                            <option value="small">
+                                Small - highly restricted
+                            </option>
+
+                            <option value="controlled">
+                                Controlled - defined access
+                            </option>
+
+                            <option value="open">
+                                Open - broadly reachable
+                            </option>
+
+                        </select>
+
+                        <p class="uia-input-help">
+                            Verify network access, segmentation
+                            and actual reachability locally.
+                        </p>
+
+                    </div>
+
+                </div>
+
+                <div class="uia-group-heading">
+
+                    <h3>2. Exploitation utility</h3>
+
+                    <p class="uia-muted uia-small">
+                        These inputs determine SSVC Utility.
+                        CVSS and EPSS are supporting evidence,
+                        not automatic substitutes.
+                    </p>
+
+                </div>
+
+                <div class="uia-input-grid">
+
+                    <div class="uia-input-card">
+
+                        <div class="uia-input-card-head">
+
+                            <label for="uia-automatable">
+                                Automatable
+                            </label>
+
+                            <span class="uia-badge"
+                                  data-status-for="automatable">
+                                Unknown
+                            </span>
+
+                        </div>
+
+                        <select id="uia-automatable"
+                                name="sysparm_uia_automatable"
+                                data-field="automatable">
+
+                            <option value="unknown">
+                                Not verified
+                            </option>
+
+                            <option value="no">
+                                No - substantial manual effort
+                            </option>
+
+                            <option value="yes">
+                                Yes - repeatable at scale
+                            </option>
+
+                        </select>
+
+                        <p class="uia-input-help">
+                            Requires evidence that exploitation
+                            can be reliably automated at scale.
+                        </p>
+
+                    </div>
+
+                    <div class="uia-input-card">
+
+                        <div class="uia-input-card-head">
+
+                            <label for="uia-value-density">
+                                Value density
+                            </label>
+
+                            <span class="uia-badge"
+                                  data-status-for="valueDensity">
+                                Unknown
+                            </span>
+
+                        </div>
+
+                        <select id="uia-value-density"
+                                name="sysparm_uia_value_density"
+                                data-field="valueDensity">
+
+                            <option value="unknown">
+                                Not verified
+                            </option>
+
+                            <option value="diffuse">
+                                Diffuse
+                            </option>
+
+                            <option value="concentrated">
+                                Concentrated
+                            </option>
+
+                        </select>
+
+                        <p class="uia-input-help">
+                            Evaluate the value available
+                            to an attacker in the affected
+                            deployment.
+                        </p>
+
+                    </div>
+
+                </div>
+
+                <div class="uia-group-heading">
+
+                    <h3>3. Human impact</h3>
+
+                    <p class="uia-muted uia-small">
+                        These inputs must be confirmed using
+                        local operational evidence.
+                        No CMDB-based inference is performed.
+                    </p>
+
+                </div>
+
+                <div class="uia-input-grid">
+
+                    <div class="uia-input-card">
+
+                        <div class="uia-input-card-head">
+
+                            <label for="uia-safety">
+                                Human safety impact
+                            </label>
+
+                            <span class="uia-badge"
+                                  data-status-for="safety">
+                                Unknown
+                            </span>
+
+                        </div>
+
+                        <select id="uia-safety"
+                                name="sysparm_uia_safety"
+                                data-field="safety">
+
+                            <option value="unknown">
+                                Not assessed
+                            </option>
+
+                            <option value="minor">
+                                None / Minor
+                            </option>
+
+                            <option value="major">
+                                Major
+                            </option>
+
+                            <option value="hazardous">
+                                Hazardous
+                            </option>
+
+                            <option value="catastrophic">
+                                Catastrophic
+                            </option>
+
+                        </select>
+
+                        <p class="uia-input-help">
+                            Confirm actual consequences for
+                            people with the responsible
+                            operational stakeholders.
+                        </p>
+
+                    </div>
+
+                    <div class="uia-input-card">
+
+                        <div class="uia-input-card-head">
+
+                            <label for="uia-mission">
+                                Mission impact
+                            </label>
+
+                            <span class="uia-badge"
+                                  data-status-for="mission">
+                                Unknown
+                            </span>
+
+                        </div>
+
+                        <select id="uia-mission"
+                                name="sysparm_uia_mission"
+                                data-field="mission">
+
+                            <option value="unknown">
+                                Not assessed
+                            </option>
+
+                            <option value="limited">
+                                Limited / degraded
+                            </option>
+
+                            <option value="mef_failure">
+                                Essential function failure
+                            </option>
+
+                            <option value="mission_failure">
+                                Overall mission failure
+                            </option>
+
+                        </select>
+
+                        <p class="uia-input-help">
+                            Confirm essential services,
+                            continuity requirements and
+                            consequences of disruption.
+                        </p>
+
+                    </div>
+
+                </div>
+
+                <div class="uia-group-heading">
+
+                    <h3>4. Remediation readiness</h3>
+
+                </div>
+
+                <div class="uia-input-grid">
+
+                    <div class="uia-input-card">
+
+                        <div class="uia-input-card-head">
+
+                            <label for="uia-patch">
+                                Vendor patch status
+                            </label>
+
+                            <span class="uia-badge"
+                                  data-status-for="patch">
+                                Unknown
+                            </span>
+
+                        </div>
+
+                        <select id="uia-patch"
+                                name="sysparm_uia_patch"
+                                data-field="patch">
+
+                            <option value="unknown">
+                                Not verified
+                            </option>
+
+                            <option value="available">
+                                Patch available
+                            </option>
+
+                            <option value="unavailable">
+                                No patch available
+                            </option>
+
+                            <option value="unsupported">
+                                Product unsupported
+                            </option>
+
+                        </select>
+
+                        <p class="uia-input-help">
+                            Verify availability and
+                            applicability using the vendor's
+                            official advisory.
+                        </p>
+
+                    </div>
+
+                </div>
+
+                <div style="margin-top:22px;
+                            display:flex;
+                            gap:10px;
+                            flex-wrap:wrap;">
+
+                    <button class="uia-btn"
+                            type="submit"
+                            name="sysparm_uia_action"
+                            value="assess">
+                        Recalculate SSVC
+                    </button>
+
+                    <button class="uia-btn uia-btn-primary"
+                            type="submit"
+                            name="sysparm_uia_action"
+                            value="save">
+                        Save Assessment
+                    </button>
+
+                </div>
+
+            </div>
+
+            <div class="uia-two-col">
+
+                <div class="uia-panel">
+
+                    <h2>SSVC decision path</h2>
+
+                    <div id="uia-ssvc-path"></div>
+
+                </div>
+
+                <div class="uia-panel">
+
+                    <h2>Supporting rationale</h2>
+
+                    <div id="uia-rationale"></div>
+
+                    <h3 style="margin-top:20px;">
+                        Missing evidence
+                    </h3>
+
+                    <div id="uia-missing"></div>
+
+                </div>
+
+            </div>
+
+        </section>
+
+        <!-- ====================================
+             ACTION PLAN
+             ==================================== -->
+
+        <section class="uia-view"
+                 id="uia-view-plan"
+                 hidden="hidden">
+
+            <div class="uia-panel">
+
+                <div class="uia-section-heading">
+
+                    <div>
+
+                        <h2>Operational action plan</h2>
+
+                        <p class="uia-muted uia-small">
+                            Step-by-step guidance generated
+                            by the existing risk service.
+                        </p>
+
+                    </div>
+
+                    <span class="uia-badge"
+                          id="uia-plan-badge">
+                        Guidance
+                    </span>
+
+                </div>
+
+                <div class="uia-guide-switch">
+
+                    <button class="uia-btn uia-btn-primary"
+                            type="button"
+                            id="uia-mitigation-tab">
+                        Mitigation
+                    </button>
+
+                    <button class="uia-btn"
+                            type="button"
+                            id="uia-patching-tab">
+                        Patching
+                    </button>
+
+                </div>
+
+                <div id="uia-guide"></div>
+
+                <div class="uia-notice">
+
+                    These steps provide decision support.
+                    Changes to production systems require
+                    the organization's normal approval,
+                    testing and change-management process.
+
+                </div>
+
+            </div>
+
+        </section>
+
+        <!-- ====================================
+             TECHNICAL INVESTIGATION
+             ==================================== -->
+
+        <section class="uia-view"
+                 id="uia-view-investigation"
+                 hidden="hidden">
+
+            <div class="uia-panel">
+                <h2>Technical investigation</h2>
+                <p class="uia-muted uia-small">
+                    Search for a recurring problem, a regression,
+                    a vendor advisory or a CVE. Public searches
+                    open in a new tab; internal knowledge results
+                    are limited by your ServiceNow permissions.
+                </p>
+
+                <label for="uia-investigation-query">
+                    Describe the issue or error message
+                </label>
+                <textarea id="uia-investigation-query"
+                          name="sysparm_uia_investigation_query"
+                          rows="3"
+                          maxlength="100"
+                          placeholder="Example: Outlook credential prompt after Windows update"></textarea>
+
+                <div class="uia-toolbar-actions" style="margin:12px 0;">
+                    <button class="uia-btn uia-btn-primary"
+                            type="submit"
+                            name="sysparm_uia_action"
+                            value="investigate">
+                        Search ServiceNow knowledge
+                    </button>
+                    <a class="uia-btn" id="uia-search-vendor"
+                       href="https://learn.microsoft.com/"
+                       target="_blank" rel="noopener noreferrer">
+                        Vendor documentation
+                    </a>
+                    <a class="uia-btn" id="uia-search-community"
+                       href="https://www.servicenow.com/community/"
+                       target="_blank" rel="noopener noreferrer">
+                        Technical communities
+                    </a>
+                    <a class="uia-btn" id="uia-search-web"
+                       href="https://www.bing.com/"
+                       target="_blank" rel="noopener noreferrer">
+                        Recent web results
+                    </a>
+                </div>
+                <p class="uia-muted uia-small">
+                    These are conventional searches, not Now Assist.
+                    AI Search requires an enabled ServiceNow integration.
+                </p>
+                <div id="uia-knowledge-results"></div>
+            </div>
+
+            <div class="uia-panel" style="margin-top:18px;">
+                <h2>Investigation evidence</h2>
+                <p class="uia-muted uia-small">
+                    Save up to five HTTPS references, each with a comment.
+                    These are analyst-provided links, not verified facts.
+                    Click Save Assessment to preserve them in a revision.
+                </p>
+                <div id="uia-evidence-links"></div>
+                <div class="uia-toolbar-actions" style="margin:12px 0;">
+                    <button class="uia-btn" id="uia-evidence-add" type="button">
+                        Add evidence link
+                    </button>
+                </div>
+                <label for="uia-evidence-notes">
+                    Investigation notes / other evidence
+                </label>
+                <textarea id="uia-evidence-notes" rows="5"
+                          maxlength="700"
+                          placeholder="Symptoms, tests, affected versions, workarounds, verification findings..."></textarea>
+                <input type="hidden" id="uia-evidence-hidden"
+                       name="sysparm_uia_evidence" />
+                <div class="uia-toolbar-actions" style="margin-top:12px;">
+                    <button class="uia-btn uia-btn-primary" type="submit"
+                            name="sysparm_uia_action" value="save">
+                        Save assessment and evidence
+                    </button>
+                </div>
+                <p class="uia-muted uia-small">
+                    Evidence shares the existing 4,000-character assessment
+                    field. If the limit is reached, saving will be rejected
+                    rather than silently discarding evidence.
+                </p>
+            </div>
+        </section>
+
+        <!-- ====================================
+             HISTORY
+             ==================================== -->
+
+        <section class="uia-view"
+                 id="uia-view-history"
+                 hidden="hidden">
+
+            <div class="uia-panel">
+
+                <div class="uia-section-heading">
+
+                    <div>
+
+                        <h2>Assessment history</h2>
+
+                        <p class="uia-muted uia-small">
+                            Immutable saved assessment
+                            revisions for this Incident.
+                        </p>
+
+                    </div>
+
+                    <span class="uia-badge"
+                          id="uia-history-count">
+                        0 revisions
+                    </span>
+
+                </div>
+
+                <div id="uia-history-content"></div>
+
+            </div>
+
+        </section>
+
+    </form>
+
+    <div class="uia-muted uia-small"
+         style="padding:12px 4px 25px;">
+
+        External intelligence requests are GET-only.
+        No automatic patch deployment is performed.
+        No CMDB dependency discovery is performed.
+        SSVC and Incident IUP remain separate decisions.
+
+    </div>
+
+</div>
+
+<pre id="uia-data"
+     style="display:none;">${jvar_plan_json}</pre>
+
+<script type="text/javascript">
+/*
+ * ServiceNow Jelly may emit XML entities literally inside HTML scripts.
+ * Avoid ampersand-based JavaScript operators here: an escaped ampersand causes
+ * an "Unexpected token ;" syntax error in the browser.
+ */
+(function () {
+
+    function byId(id) {
+        return document.getElementById(id);
+    }
+
+    function el(tag, value) {
+
+        var node = document.createElement(tag);
+
+        if (value !== undefined) {
+            node.textContent = String(value);
+        }
+
+        return node;
+    }
+
+    function clear(node) {
+
+        while (node.firstChild) {
+            node.removeChild(node.firstChild);
+        }
+    }
+
+    function appendText(target, tag, value) {
+
+        var node = el(tag, value);
+        target.appendChild(node);
+
+        return node;
+    }
+
+    function dataRow(target, label, value) {
+
+        var item = el('div');
+        item.className = 'uia-data-row';
+
+        item.appendChild(
+            el('strong', label)
+        );
+
+        item.appendChild(
+            el(
+                'span',
+                value === null ||
+                value === undefined ||
+                value === ''
+                    ? 'Not recorded'
+                    : value
+            )
+        );
+
+        target.appendChild(item);
+    }
+
+    function badge(text, style) {
+
+        var item = el('span', text);
+
+        item.className =
+            'uia-badge' +
+            (style ? ' uia-badge-' + style : '');
+
+        return item;
+    }
+
+    function notice(text, style) {
+
+        var item = el('div', text);
+
+        item.className =
+            'uia-notice' +
+            (style ? ' uia-notice-' + style : '');
+
+        return item;
+    }
+
+    function list(target, items) {
+
+        clear(target);
+
+        if (!items || !items.length) {
+
+            appendText(
+                target,
+                'p',
+                'None recorded.'
+            ).className = 'uia-muted';
+
+            return;
+        }
+
+        var ul = el('ul');
+
+        items.forEach(function (item) {
+
+            ul.appendChild(
+                el('li', item)
+            );
+        });
+
+        target.appendChild(ul);
+    }
+
+    function link(target, url) {
+
+        if (!/^https:\/\//i.test(url)) {
+            return;
+        }
+
+        var anchor = el('a', url);
+
+        anchor.href = url;
+        anchor.target = '_blank';
+        anchor.rel = 'noopener noreferrer';
+
+        target.appendChild(anchor);
+    }
+
+    function percent(value, digits) {
+
+        if (
+            value === null ||
+            value === undefined ||
+            !isFinite(Number(value))
+        ) {
+            return 'Unavailable';
+        }
+
+        return (
+            Number(value) * 100
+        ).toFixed(digits) + '%';
+    }
+
+    function sourceCard(title, subtitle) {
+
+        var card = el('div');
+        card.className = 'uia-source-card';
+
+        var top = el('div');
+        top.className = 'uia-source-top';
+
+        var heading = el('div');
+
+        heading.appendChild(
+            el('h3', title)
+        );
+
+        appendText(
+            heading,
+            'div',
+            subtitle
+        ).className = 'uia-muted uia-small';
+
+        top.appendChild(heading);
+        card.appendChild(top);
+
+        return {
+            card: card,
+            top: top
+        };
+    }
+
+    function details(target, title, content) {
+
+        var block = el('details');
+        block.className = 'uia-details';
+
+        block.appendChild(
+            el('summary', title)
+        );
+
+        var body = el('div');
+        body.className = 'uia-details-body';
+
+        if (typeof content === 'string') {
+
+            body.appendChild(
+                el('p', content)
+            );
+
+        } else if (content) {
+
+            body.appendChild(content);
+        }
+
+        block.appendChild(body);
+        target.appendChild(block);
+    }
+
+    function sourceStatusLabel(status) {
+
+        if (status === 'updated') {
+            return badge('Retrieved', 'green');
+        }
+
+        if (status === 'retained') {
+            return badge('Previous evidence', 'amber');
+        }
+
+        if (status === 'unavailable') {
+            return badge('Unavailable', 'red');
+        }
+
+        return badge('Saved evidence');
+    }
+
+    /*
+     * Tab navigation has exactly one owner: initializeNavigation.
+     * Never bind tab click handlers inside render(). A failure in
+     * the assessment renderer must not disable navigation.
+     */
+    var TAB_NAMES = [
+        'overview', 'intelligence', 'ssvc', 'plan', 'investigation', 'history'
+    ];
+
+    var navigationInitialized = false;
+
+    function setTab(name) {
+
+        if (TAB_NAMES.indexOf(name) === -1) {
+            name = 'overview';
+        }
+
+        var buttons = document.querySelectorAll(
+            '#uia-app .uia-tab[data-tab]'
+        );
+
+        Array.prototype.forEach.call(buttons, function (button) {
+            var selected = button.getAttribute('data-tab') === name;
+
+            button.className = 'uia-tab' +
+                (selected ? ' uia-active' : '');
+            button.setAttribute('aria-selected', selected ? 'true' : 'false');
+            button.setAttribute('tabindex', selected ? '0' : '-1');
+        });
+
+        TAB_NAMES.forEach(function (tabName) {
+            var view = byId('uia-view-' + tabName);
+            if (!view) {
+                return;
+            }
+
+            if (tabName === name) {
+                view.removeAttribute('hidden');
+                view.style.display = '';
+            } else {
+                view.setAttribute('hidden', 'hidden');
+                view.style.display = 'none';
+            }
+        });
+
+        var activeTab = byId('uia-active-tab');
+        if (activeTab) {
+            activeTab.value = name;
+        }
+    }
+
+    function attentionItem(target, title, description, symbol) {
+
+        var item = el('div');
+        item.className = 'uia-attention-item';
+
+        var icon = el('div', symbol || '!');
+        icon.className = 'uia-attention-icon';
+
+        var body = el('div');
+
+        body.appendChild(
+            el('strong', title)
+        );
+
+        appendText(
+            body,
+            'div',
+            description
+        ).className = 'uia-muted uia-small';
+
+        item.appendChild(icon);
+        item.appendChild(body);
+
+        target.appendChild(item);
+    }
+
+    function currentFieldValue(name) {
+
+        var field = document.querySelector(
+            '[data-field="' + name + '"]'
+        );
+
+        return field ? field.value : 'unknown';
+    }
+
+    function updateCompleteness() {
+
+        var names = [
+            'applicability',
+            'exploitation',
+            'exposure',
+            'automatable',
+            'valueDensity',
+            'safety',
+            'mission',
+            'patch'
+        ];
+
+        var completed = 0;
+
+        names.forEach(function (name) {
+
+            var value = currentFieldValue(name);
+
+            if (
+                value !== '' ? value !== 'unknown' : false
+            ) {
+                completed++;
+            }
+        });
+
+        byId('uia-completeness-badge').textContent =
+            completed + ' / 8';
+
+        byId('uia-progress-fill').style.width =
+            (completed / 8 * 100) + '%';
+
+        byId('uia-completeness-text').textContent =
+            (8 - completed) +
+            ' input(s) still unknown or unreviewed.';
+
+        return completed;
+    }
+
+    function updateFieldBadges(plan) {
+
+        var fields = document.querySelectorAll(
+            '[data-status-for]'
+        );
+
+        var suggestion =
+            plan.suggestions
+                ? plan.suggestions.exploitation
+                : null;
+
+        Array.prototype.forEach.call(
+            fields,
+            function (statusNode) {
+
+                var name = statusNode.getAttribute(
+                    'data-status-for'
+                );
+
+                var value = currentFieldValue(name);
+
+                var label = 'Entered';
+                var color = 'green';
+
+                if (
+                    !value ||
+                    value === 'unknown'
+                ) {
+
+                    label = 'Needs review';
+                    color = 'amber';
+                }
+
+                if (
+                    name === 'exploitation' ?
+                    (suggestion ? suggestion.kevListed : false) : false
+                ) {
+
+                    if (value === 'active') {
+
+                        label = 'KEV supported';
+                        color = 'green';
+
+                    } else if (
+                        value !== 'unknown'
+                    ) {
+
+                        label = 'Review conflict';
+                        color = 'red';
+                    }
+                }
+
+                statusNode.className =
+                    'uia-badge uia-badge-' + color;
+
+                statusNode.textContent = label;
+            }
+        );
+    }
+
+    function renderSuggestions(plan) {
+
+        var target = byId(
+            'uia-suggestion-panel'
+        );
+
+        clear(target);
+
+        var suggestion =
+            plan.suggestions
+                ? plan.suggestions.exploitation
+                : null;
+
+        if (!suggestion) {
+            return;
+        }
+
+        var value =
+            currentFieldValue('exploitation');
+
+        if (suggestion.autoApplied) {
+
+            target.appendChild(
+                notice(
+                    'Automatically prefilled: Exploitation = Active. ' +
+                    'A freshly retrieved CISA KEV catalog lists this CVE. ' +
+                    'Review the value before saving.',
+                    'success'
+                )
+            );
+
+        } else if (
+            suggestion.kevListed ? value === 'active' : false
+        ) {
+
+            target.appendChild(
+                notice(
+                    'Exploitation = Active is supported by ' +
+                    'the retrieved CISA KEV evidence.',
+                    'success'
+                )
+            );
+
+        } else if (
+            suggestion.kevListed ? value !== 'unknown' : false
+        ) {
+
+            target.appendChild(
+                notice(
+                    'Evidence conflict: CISA KEV lists this ' +
+                    'vulnerability as exploited in the wild, ' +
+                    'but the current Exploitation value is ' +
+                    'different. The manual value was preserved. ' +
+                    'Review it before saving.',
+                    'warning'
+                )
+            );
+
+        } else if (
+            suggestion.kevListed
+        ) {
+
+            target.appendChild(
+                notice(
+                    'CISA KEV supports Active exploitation. ' +
+                    'Run Check for Updates to verify the current ' +
+                    'catalog and prefill an unknown value.',
+                    'warning'
+                )
+            );
+
+        } else {
+
+            target.appendChild(
+                notice(
+                    'No automatic SSVC change was made. ' +
+                    'CISA KEV absence does not prove that ' +
+                    'exploitation is absent. Other SSVC ' +
+                    'inputs still require appropriate evidence.',
+                    ''
+                )
+            );
+        }
+
+        var explanation = el('p');
+
+        explanation.className =
+            'uia-muted uia-small';
+
+        explanation.textContent =
+            suggestion.explanation;
+
+        target.appendChild(explanation);
+    }
+
+    function renderIntelligence(plan) {
+
+        var target =
+            byId('uia-intel-sources');
+
+        clear(target);
+
+        var intel = plan.intelligence;
+
+        if (!intel) {
+
+            var empty = el('div');
+            empty.className = 'uia-panel';
+
+            empty.appendChild(
+                el(
+                    'h3',
+                    'No intelligence retrieved yet'
+                )
+            );
+
+            appendText(
+                empty,
+                'p',
+                'Enter a CVE and use Check for Updates.'
+            ).className = 'uia-muted';
+
+            target.appendChild(empty);
+
+            return;
+        }
+
+        byId('uia-intel-meta').textContent =
+            'Last lookup: ' +
+            (intel.retrievedAt || 'Unknown');
+
+        var status =
+            intel.sourceStatus || {};
+
+        // NVD
+
+        var nvd = sourceCard(
+            'NVD',
+            'Vulnerability details and CVSS metadata'
+        );
+
+        nvd.top.appendChild(
+            sourceStatusLabel(status.nvd)
+        );
+
+        if (intel.nvd) {
+
+            if (intel.nvd.found) {
+
+                dataRow(
+                    nvd.card,
+                    'CVSS score',
+                    intel.nvd.score || 'Unavailable'
+                );
+
+                dataRow(
+                    nvd.card,
+                    'Severity',
+                    intel.nvd.severity || 'Unavailable'
+                );
+
+                dataRow(
+                    nvd.card,
+                    'Last modified',
+                    intel.nvd.modified || 'Unknown'
+                );
+
+                if (intel.nvd.description) {
+
+                    details(
+                        nvd.card,
+                        'Vulnerability description',
+                        intel.nvd.description
+                    );
+                }
+
+                var refs =
+                    intel.nvd.references || [];
+
+                if (refs.length) {
+
+                    var refList = el('ul');
+
+                    refs.forEach(function (url) {
+
+                        var li = el('li');
+
+                        link(li, url);
+
+                        refList.appendChild(li);
+                    });
+
+                    details(
+                        nvd.card,
+                        'Technical references',
+                        refList
+                    );
+                }
+
+            } else {
+
+                appendText(
+                    nvd.card,
+                    'p',
+                    'No NVD record found.'
+                ).className = 'uia-muted';
+            }
+
+        } else {
+
+            appendText(
+                nvd.card,
+                'p',
+                'NVD information unavailable.'
+            ).className = 'uia-muted';
+        }
+
+        target.appendChild(nvd.card);
+
+        // CISA KEV
+
+        var kev = sourceCard(
+            'CISA KEV',
+            'Known Exploited Vulnerabilities catalog'
+        );
+
+        kev.top.appendChild(
+            sourceStatusLabel(status.kev)
+        );
+
+        if (intel.kev) {
+
+            if (intel.kev.listed) {
+
+                kev.card.appendChild(
+                    notice(
+                        'This CVE is listed in the CISA ' +
+                        'Known Exploited Vulnerabilities catalog.',
+                        'warning'
+                    )
+                );
+
+                dataRow(
+                    kev.card,
+                    'Date added',
+                    intel.kev.dateAdded
+                );
+
+                dataRow(
+                    kev.card,
+                    'Vendor',
+                    intel.kev.vendor
+                );
+
+                dataRow(
+                    kev.card,
+                    'Product',
+                    intel.kev.product
+                );
+
+                if (intel.kev.requiredAction) {
+
+                    details(
+                        kev.card,
+                        'CISA required action',
+                        intel.kev.requiredAction
+                    );
+                }
+
+            } else {
+
+                appendText(
+                    kev.card,
+                    'p',
+                    'Not listed in the retrieved catalog. ' +
+                    'This does not prove exploitation is absent.'
+                ).className = 'uia-muted';
+            }
+
+        } else {
+
+            appendText(
+                kev.card,
+                'p',
+                'CISA KEV information unavailable.'
+            ).className = 'uia-muted';
+        }
+
+        target.appendChild(kev.card);
+
+        // FIRST EPSS
+
+        var epss = sourceCard(
+            'FIRST EPSS',
+            'Predicted exploitation probability'
+        );
+
+        epss.top.appendChild(
+            sourceStatusLabel(status.epss)
+        );
+
+        if (
+            intel.epss ? intel.epss.found : false
+        ) {
+
+            dataRow(
+                epss.card,
+                '30-day probability',
+                percent(
+                    intel.epss.probability,
+                    2
+                )
+            );
+
+            dataRow(
+                epss.card,
+                'Percentile',
+                percent(
+                    intel.epss.percentile,
+                    1
+                )
+            );
+
+            dataRow(
+                epss.card,
+                'Score date',
+                intel.epss.date
+            );
+
+        } else {
+
+            appendText(
+                epss.card,
+                'p',
+                'No EPSS score available.'
+            ).className = 'uia-muted';
+        }
+
+        target.appendChild(epss.card);
+
+        // Warnings
+
+        if (
+            intel.errors ? intel.errors.length : false
+        ) {
+
+            var warning = el('div');
+            warning.className = 'uia-panel';
+
+            warning.appendChild(
+                el('h3', 'Source warnings')
+            );
+
+            list(
+                warning,
+                intel.errors
+            );
+
+            target.appendChild(warning);
+        }
+
+        // Changes
+
+        var changes =
+            byId('uia-intel-differences');
+
+        clear(changes);
+
+        if (
+            plan.differences ? plan.differences.length : false
+        ) {
+
+            list(
+                changes,
+                plan.differences
+            );
+
+        } else {
+
+            appendText(
+                changes,
+                'p',
+                'No new material source changes reported.'
+            ).className = 'uia-muted';
+        }
+    }
+
+    function renderOverview(plan) {
+
+        var context = plan.context;
+        var decision = plan.decision;
+        var intel = plan.intelligence;
+
+        byId('uia-metric-ssvc').textContent =
+            decision.priority || 'Incomplete';
+
+        byId('uia-metric-ssvc-sub').textContent =
+            decision.incomplete
+                ? 'Evidence incomplete'
+                : 'Calculated SSVC response';
+
+        byId('uia-metric-priority').textContent =
+            plan.priority || '-';
+
+        // Resolve the nested intelligence objects before selecting labels.
+        // A KEV record is an object, not a displayable string.
+        var nvdEvidence = intel ? intel.nvd : null;
+        var kevEvidence = intel ? intel.kev : null;
+
+        byId('uia-metric-cvss').textContent =
+            nvdEvidence ? nvdEvidence.score : null
+                ? nvdEvidence.score
+                : '-';
+
+        byId('uia-metric-severity').textContent =
+            nvdEvidence ? nvdEvidence.severity : null
+                ? nvdEvidence.severity
+                : 'NVD intelligence';
+
+        byId('uia-metric-kev').textContent =
+            kevEvidence
+                ? (kevEvidence.listed === true ? 'Listed' : 'Not listed')
+                : 'Unknown';
+
+        byId('uia-decision-title').textContent =
+            decision.title || 'Assessment pending';
+
+        byId('uia-decision-summary').textContent =
+            decision.summary || '';
+
+        var warning =
+            byId('uia-decision-warning');
+
+        clear(warning);
+
+        if (decision.incomplete) {
+
+            warning.appendChild(
+                notice(
+                    'The SSVC decision is provisional ' +
+                    'because required evidence is incomplete.',
+                    'warning'
+                )
+            );
+        }
+
+        // Attention list
+
+        var attention =
+            byId('uia-attention-list');
+
+        clear(attention);
+
+        var missing = [];
+
+        [
+            ['applicability', 'Confirm affected version'],
+            ['exploitation', 'Review exploitation evidence'],
+            ['exposure', 'Verify actual exposure'],
+            ['automatable', 'Verify exploit automation'],
+            ['valueDensity', 'Assess value density'],
+            ['safety', 'Assess human safety impact'],
+            ['mission', 'Assess mission impact'],
+            ['patch', 'Verify vendor patch availability']
+        ].forEach(
+            function (item) {
+
+                if (
+                    context[item[0]] === 'unknown'
+                ) {
+                    missing.push(item[1]);
+                }
+            }
+        );
+
+        if (
+            plan.suggestions ?
+                (plan.suggestions.exploitation ?
+                    plan.suggestions.exploitation.conflict : false) : false
+        ) {
+
+            attentionItem(
+                attention,
+                'Review conflicting exploitation evidence',
+                'CISA KEV indicates exploitation in the wild, ' +
+                'but the current manual SSVC value differs.',
+                '!'
+            );
+        }
+
+        missing.slice(0, 5).forEach(
+            function (item) {
+
+                attentionItem(
+                    attention,
+                    item,
+                    'Local verification is required ' +
+                    'before relying on this input.',
+                    '?'
+                );
+            }
+        );
+
+        if (!missing.length) {
+
+            attentionItem(
+                attention,
+                'All eight inputs are populated',
+                'Confirm the supporting evidence remains ' +
+                'accurate and current.',
+                '+'
+            );
+        }
+
+        // Incident context
+
+        var incident =
+            byId('uia-incident-context');
+
+        clear(incident);
+
+        dataRow(
+            incident,
+            'Incident',
+            plan.incidentNumber
+        );
+
+        dataRow(
+            incident,
+            'Impact',
+            plan.impact
+        );
+
+        dataRow(
+            incident,
+            'Urgency',
+            plan.urgency
+        );
+
+        dataRow(
+            incident,
+            'Priority',
+            plan.priority
+        );
+
+        dataRow(
+            incident,
+            'Configuration Item',
+            plan.configurationItem || 'Unknown'
+        );
+
+        var contact =
+            plan.contact || {};
+
+        dataRow(
+            incident,
+            'Assignment group',
+            contact.group || 'Unassigned'
+        );
+
+        dataRow(
+            incident,
+            'Assigned technician',
+            contact.name || 'Unassigned'
+        );
+
+        // Saved state
+
+        var saved =
+            byId('uia-saved-summary');
+
+        clear(saved);
+
+        dataRow(
+            saved,
+            'Latest revision',
+            plan.latestRevision || 'Not saved'
+        );
+
+        dataRow(
+            saved,
+            'Last saved',
+            plan.latestSavedAt || 'Not saved'
+        );
+
+        dataRow(
+            saved,
+            'CVE',
+            context.cve || 'Not entered'
+        );
+
+        dataRow(
+            saved,
+            'SSVC response',
+            decision.priority || 'Incomplete'
+        );
+    }
+
+    function renderDecisionPath(plan) {
+
+        var context = plan.context;
+
+        var target =
+            byId('uia-ssvc-path');
+
+        clear(target);
+
+        [
+            ['Exploitation', context.exploitation],
+            ['Exposure', context.exposure],
+            ['Automatable', context.automatable],
+            ['Value density', context.valueDensity],
+            ['Utility', context.utility],
+            ['Human safety', context.safety],
+            ['Mission impact', context.mission],
+            ['Human Impact', context.humanImpact],
+            ['SSVC response', plan.decision.priority]
+        ].forEach(
+            function (item) {
+
+                dataRow(
+                    target,
+                    item[0],
+                    String(
+                        item[1] || 'Unknown'
+                    ).replace(/_/g, ' ')
+                );
+            }
+        );
+
+        list(
+            byId('uia-rationale'),
+            plan.rationale || []
+        );
+
+        list(
+            byId('uia-missing'),
+            plan.missingInformation || []
+        );
+    }
+
+    function renderGuide(plan, mode) {
+
+        var target =
+            byId('uia-guide');
+
+        clear(target);
+
+        var steps = mode === 'patching'
+            ? plan.patchingGuide
+            : plan.mitigationGuide;
+
+        byId('uia-mitigation-tab').className =
+            'uia-btn' +
+            (mode === 'mitigation'
+                ? ' uia-btn-primary'
+                : '');
+
+        byId('uia-patching-tab').className =
+            'uia-btn' +
+            (mode === 'patching'
+                ? ' uia-btn-primary'
+                : '');
+
+        byId('uia-plan-badge').textContent =
+            mode === 'patching'
+                ? 'Patching'
+                : 'Mitigation';
+
+        (steps || []).forEach(
+            function (step, index) {
+
+                var card = el('div');
+                card.className = 'uia-step';
+
+                var number = el(
+                    'div',
+                    index + 1
+                );
+
+                number.className =
+                    'uia-step-number';
+
+                var body = el('div');
+                body.className =
+                    'uia-step-content';
+
+                body.appendChild(
+                    el('h3', step.title)
+                );
+
+                appendText(
+                    body,
+                    'p',
+                    step.action
+                ).className =
+                    'uia-step-action';
+
+                appendText(
+                    body,
+                    'p',
+                    'Responsible: ' + step.role
+                ).className =
+                    'uia-step-role';
+
+                details(
+                    body,
+                    'Why and how',
+                    step.explanation
+                );
+
+                card.appendChild(number);
+                card.appendChild(body);
+
+                target.appendChild(card);
+            }
+        );
+
+        if (!steps || !steps.length) {
+
+            appendText(
+                target,
+                'p',
+                'No guidance returned by the risk service.'
+            ).className = 'uia-muted';
+        }
+    }
+
+    // Analyst-provided links are kept separate from trusted feeds.
+    function renderInvestigation(plan) {
+        var container = byId('uia-evidence-links');
+        var evidence = plan.evidence || { links: [], notes: '' };
+        var links = evidence.links || [];
+        var notes = byId('uia-evidence-notes');
+        var query = byId('uia-investigation-query');
+        notes.value = evidence.notes || '';
+        query.value = plan.investigationQuery || '';
+
+        function syncEvidence() {
+            var collected = [];
+            var rows = container.querySelectorAll('.uia-evidence-row');
+            Array.prototype.forEach.call(rows, function (row) {
+                var url = row.querySelector('.uia-evidence-url').value.trim();
+                var comment = row.querySelector('.uia-evidence-comment').value.trim();
+                if (url) {
+                    collected.push({ url: url, comment: comment });
+                }
+            });
+            byId('uia-evidence-hidden').value = JSON.stringify({
+                links: collected,
+                notes: notes.value
+            });
+        }
+
+        function addEvidence(url, comment) {
+            if (container.querySelectorAll('.uia-evidence-row').length >= 5) {
+                return;
+            }
+            var row = el('div');
+            row.className = 'uia-evidence-row';
+            row.style.cssText = 'display:grid;grid-template-columns:1fr 1fr auto;gap:10px;margin:10px 0;align-items:center';
+            var urlInput = el('input');
+            urlInput.className = 'uia-evidence-url';
+            urlInput.type = 'url';
+            urlInput.maxLength = 300;
+            urlInput.placeholder = 'https://...';
+            urlInput.value = url || '';
+            urlInput.setAttribute('aria-label', 'Evidence URL');
+            var commentInput = el('input');
+            commentInput.className = 'uia-evidence-comment';
+            commentInput.maxLength = 180;
+            commentInput.placeholder = 'What does this source establish?';
+            commentInput.value = comment || '';
+            commentInput.setAttribute('aria-label', 'Evidence comment');
+            var remove = el('button', 'Remove');
+            remove.type = 'button';
+            remove.className = 'uia-btn';
+            remove.addEventListener('click', function () {
+                container.removeChild(row);
+                syncEvidence();
+                markDirty();
+            });
+            [urlInput, commentInput].forEach(function (input) {
+                input.addEventListener('input', function () {
+                    syncEvidence();
+                    markDirty();
+                });
+            });
+            row.appendChild(urlInput);
+            row.appendChild(commentInput);
+            row.appendChild(remove);
+            container.appendChild(row);
+            syncEvidence();
+        }
+
+        links.forEach(function (item) {
+            addEvidence(item.url, item.comment);
+        });
+        byId('uia-evidence-add').addEventListener('click', function () {
+            addEvidence('', '');
+            markDirty();
+        });
+        notes.addEventListener('input', function () {
+            syncEvidence();
+            markDirty();
+        });
+        syncEvidence();
+
+        function updateSearchLinks() {
+            var q = query.value.trim();
+            byId('uia-search-vendor').href =
+                'https://www.bing.com/search?q=' +
+                encodeURIComponent('(site:learn.microsoft.com OR site:docs.servicenow.com OR site:docs.redhat.com OR site:docs.oracle.com) ' + q);
+            byId('uia-search-community').href =
+                'https://www.bing.com/search?q=' +
+                encodeURIComponent('(site:servicenow.com/community OR site:stackoverflow.com OR site:github.com) ' + q);
+            byId('uia-search-web').href =
+                'https://www.google.com/search?q=' +
+                encodeURIComponent(q + ' troubleshooting') + String.fromCharCode(38) + 'tbs=qdr:m';
+        }
+        query.addEventListener('input', updateSearchLinks);
+        updateSearchLinks();
+
+        var results = byId('uia-knowledge-results');
+        clear(results);
+        var articles = plan.knowledgeResults || [];
+        if (plan.investigationQuery) {
+            results.appendChild(el('h3', 'ServiceNow knowledge matches'));
+            if (!articles.length) {
+                results.appendChild(notice(
+                    'No accessible published knowledge articles matched the phrase. Try fewer keywords or check knowledge permissions.'
+                ));
+            }
+            articles.forEach(function (article) {
+                var p = el('p');
+                var a = el('a', (article.number || 'Knowledge') + ': ' + article.title);
+                a.href = '/kb_knowledge.do?sys_id=' + encodeURIComponent(article.id);
+                a.target = '_blank';
+                a.rel = 'noopener noreferrer';
+                p.appendChild(a);
+                results.appendChild(p);
+            });
+        }
+    }
+
+    function renderHistory(plan) {
+
+        var items = plan.history || [];
+
+        var target =
+            byId('uia-history-content');
+
+        clear(target);
+
+        byId('uia-history-count').textContent =
+            items.length +
+            (items.length === 1
+                ? ' revision'
+                : ' revisions');
+
+        if (!items.length) {
+
+            appendText(
+                target,
+                'p',
+                'No saved assessment revisions yet.'
+            ).className = 'uia-muted';
+
+            return;
+        }
+
+        var scroll = el('div');
+        scroll.className = 'uia-table-scroll';
+
+        var table = el('table');
+        table.className = 'uia-history';
+
+        var header = el('tr');
+
+        [
+            'Revision',
+            'Saved at',
+            'Saved by',
+            'CVE',
+            'SSVC response'
+        ].forEach(
+            function (heading) {
+
+                header.appendChild(
+                    el('th', heading)
+                );
+            }
+        );
+
+        table.appendChild(header);
+
+        items.forEach(
+            function (item) {
+
+                var tr = el('tr');
+
+                var decision =
+                    item.decision || {};
+
+                [
+                    item.revision,
+                    item.created,
+                    item.author,
+                    item.cve,
+                    decision.priority || 'Unknown'
+                ].forEach(
+                    function (value) {
+
+                        tr.appendChild(
+                            el('td', value)
+                        );
+                    }
+                );
+
+                table.appendChild(tr);
+            }
+        );
+
+        scroll.appendChild(table);
+        target.appendChild(scroll);
+    }
+
+    function markDirty() {
+
+        byId('uia-dirty-message').className =
+            'uia-notice uia-notice-warning';
+
+        byId('uia-toolbar-status').textContent =
+            'Unsaved assessment changes';
+    }
+
+    function safeRender(section, callback) {
+        try {
+            callback();
+        } catch (error) {
+            var status = byId('uia-status');
+            if (status) {
+                status.appendChild(notice(
+                    section + ' could not be displayed: ' +
+                    (error.message || String(error)),
+                    'error'
+                ));
+            }
+        }
+    }
+
+    function render() {
+
+        try {
+
+            var raw =
+                byId('uia-data')
+                    .textContent
+                    .trim();
+
+            if (!raw || raw === 'null') {
+
+                byId('uia-status').appendChild(
+                    notice(
+                        'No assessment data was returned.',
+                        'error'
+                    )
+                );
+
+                return;
+            }
+
+            var plan = JSON.parse(raw);
+
+            if (!plan || !plan.success) {
+
+                byId('uia-status').appendChild(
+                    notice(
+                        plan ? plan.message : false
+                            ? plan.message
+                            : 'Assessment unavailable.',
+                        'error'
+                    )
+                );
+
+                return;
+            }
+
+            var context =
+                plan.context || {};
+
+            // Hidden fields
+
+            byId('uia-incident-id').value =
+                plan.incidentId;
+
+            byId('uia-intel-hidden').value =
+                plan.intelligence
+                    ? JSON.stringify(plan.intelligence)
+                    : '';
+
+            // Header
+
+            byId('uia-incident-badge').textContent =
+                plan.incidentNumber || 'Incident';
+
+            byId('uia-cve-badge').textContent =
+                context.cve || 'No CVE';
+
+            byId('uia-revision-badge').textContent =
+                plan.latestRevision
+                    ? 'Revision ' + plan.latestRevision
+                    : 'Not saved';
+
+            byId('uia-last-saved').textContent =
+                plan.latestSavedAt
+                    ? 'Last saved: ' + plan.latestSavedAt
+                    : 'No saved assessment';
+
+            byId('uia-toolbar-status').textContent =
+                plan.latestRevision
+                    ? 'Saved revision ' +
+                      plan.latestRevision
+                    : 'Assessment not yet saved';
+
+            // Status messages
+
+            if (plan.statusMessage) {
+
+                byId('uia-status').appendChild(
+                    notice(
+                        plan.statusMessage,
+                        plan.statusError
+                            ? 'error'
+                            : (
+                                plan.suggestions ?
+                                    (plan.suggestions.exploitation ?
+                                        plan.suggestions.exploitation.autoApplied : false) : false
+                                    ? 'success'
+                                    : ''
+                            )
+                    )
+                );
+            }
+
+            // Restore saved or submitted inputs.
+
+            var fields =
+                document.querySelectorAll(
+                    '[data-field]'
+                );
+
+            Array.prototype.forEach.call(
+                fields,
+                function (field) {
+
+                    var name = field.getAttribute(
+                        'data-field'
+                    );
+
+                    if (
+                        context[name] !== undefined
+                    ) {
+                        field.value =
+                            context[name];
+                    }
+                }
+            );
+
+            // Render dashboard and sections.
+
+            // Each section is isolated: one rendering error must
+            // not prevent the other sections from initializing.
+            safeRender('Overview', function () { renderOverview(plan); });
+            safeRender('Intelligence', function () { renderIntelligence(plan); });
+            safeRender('SSVC suggestions', function () { renderSuggestions(plan); });
+            safeRender('SSVC decision path', function () { renderDecisionPath(plan); });
+            safeRender('History', function () { renderHistory(plan); });
+            safeRender('Technical investigation', function () { renderInvestigation(plan); });
+            safeRender('Completeness', updateCompleteness);
+            safeRender('Field badges', function () { updateFieldBadges(plan); });
+
+            // Navigation is initialized independently of render().
+
+            byId(
+                'uia-overview-history'
+            ).addEventListener(
+                'click',
+                function () {
+                    setTab('history');
+                }
+            );
+
+            // Guide switch
+
+            byId(
+                'uia-mitigation-tab'
+            ).addEventListener(
+                'click',
+                function () {
+
+                    renderGuide(
+                        plan,
+                        'mitigation'
+                    );
+                }
+            );
+
+            byId(
+                'uia-patching-tab'
+            ).addEventListener(
+                'click',
+                function () {
+
+                    renderGuide(
+                        plan,
+                        'patching'
+                    );
+                }
+            );
+
+            safeRender('Action plan', function () {
+                renderGuide(
+                    plan,
+                    context.patch === 'available'
+                        ? 'patching'
+                        : 'mitigation'
+                );
+            });
+
+            // Field changes do not silently recalculate
+            // the server-side decision.
+
+            Array.prototype.forEach.call(
+                fields,
+                function (field) {
+
+                    field.addEventListener(
+                        'change',
+                        function () {
+
+                            markDirty();
+                            updateCompleteness();
+                            updateFieldBadges(plan);
+
+                            if (
+                                field.getAttribute(
+                                    'data-field'
+                                ) === 'exploitation'
+                            ) {
+                                renderSuggestions(plan);
+                            }
+
+                            if (
+                                field.getAttribute(
+                                    'data-field'
+                                ) === 'cve'
+                            ) {
+
+                                var currentCve =
+                                    field.value
+                                        .trim()
+                                        .toUpperCase();
+
+                                byId('uia-cve-badge')
+                                    .textContent =
+                                        currentCve ||
+                                        'No CVE';
+
+                                if (
+                                    plan.intelligence ?
+                                    currentCve !== plan.intelligence.cve : false
+                                ) {
+
+                                    byId(
+                                        'uia-intel-hidden'
+                                    ).value = '';
+                                }
+                            }
+                        }
+                    );
+                }
+            );
+
+            // Preserve active tab on form submission.
+
+            byId('uia-form').addEventListener(
+                'submit',
+                function (event) {
+                    var raw = byId('uia-evidence-hidden').value;
+                    if (raw) {
+                        var submitted = JSON.parse(raw);
+                        var invalid = (submitted.links || []).some(function (item) {
+                            return !/^https:\/\/[^\s]+$/i.test(item.url);
+                        });
+                        if (invalid) {
+                            event.preventDefault();
+                            setTab('investigation');
+                            byId('uia-status').appendChild(notice(
+                                'Evidence links must use valid HTTPS URLs.', 'error'
+                            ));
+                            return;
+                        }
+                    }
+
+
+                    byId('uia-cve').value =
+                        byId('uia-cve')
+                            .value
+                            .trim()
+                            .toUpperCase();
+                }
+            );
+
+            // Return to Incident.
+
+            byId('uia-return').addEventListener(
+                'click',
+                function () {
+
+                    window.location.href =
+                        '/incident.do?sys_id=' +
+                        encodeURIComponent(
+                            plan.incidentId
+                        );
+                }
+            );
+
+            // Initial tab after page load.
+
+            setTab(
+                plan.activeTab || 'overview'
+            );
+
+        } catch (error) {
+
+            byId('uia-status').appendChild(
+                notice(
+                    'Assessment rendering error: ' +
+                    error.message,
+                    'error'
+                )
+            );
+        }
+    }
+
+    /*
+     * One delegated tab listener, installed before assessment
+     * rendering. It also works when the server returns an error.
+     * Guard against duplicate initialization and late DOM loading.
+     */
+    function initializeNavigation() {
+        if (navigationInitialized) {
+            return;
+        }
+
+        var nav = document.querySelector('#uia-app .uia-tabs');
+        if (!nav) {
+            return;
+        }
+
+        navigationInitialized = true;
+
+        nav.addEventListener('click', function (event) {
+            var button = event.target;
+
+            while (button ? button !== nav : false) {
+                if (button.getAttribute ?
+                    button.getAttribute('data-tab') : false) {
+                    event.preventDefault();
+                    setTab(button.getAttribute('data-tab'));
+                    return;
+                }
+                button = button.parentNode;
+            }
+        });
+
+        setTab('overview');
+    }
+
+    function start() {
+        initializeNavigation();
+        render();
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', start);
+    } else {
+        start();
+    }
+
+})();
+</script>
+
+</j:jelly>
