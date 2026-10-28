@@ -1,121 +1,97 @@
-#ServiecNow Patching &amp; Mitigation Scoped App
+# Patch & Mitigation Assessment — ServiceNow
 
-<img width="1275" height="1190" alt="image" src="https://github.com/user-attachments/assets/9d9d9268-789f-4864-adaa-97b84b237dce" />
-<img width="1283" height="1187" alt="image" src="https://github.com/user-attachments/assets/c2b58489-0375-4ab3-9296-3e49311c08fd" />
+**Patch & Mitigation Assessment** is a custom ServiceNow application developed to support IT operations and security teams with vulnerability assessment, remediation prioritization, technical troubleshooting, and evidence-based decision-making.
 
-<img width="1279" height="1186" alt="image" src="https://github.com/user-attachments/assets/30551dbb-90d3-415f-81f7-452b637e350c" />
-<img width="1268" height="596" alt="image" src="https://github.com/user-attachments/assets/746a54d6-d367-4a46-a337-662ac064d9e1" />
+The application integrates vulnerability intelligence with the **SSVC 2.0 Deployer decision tree** and generates actionable mitigation and patching guidance directly from ServiceNow Incident records.
 
-<img width="1261" height="1083" alt="image" src="https://github.com/user-attachments/assets/93604b72-4d8a-4c86-9444-f436f929bbdf" />
-<img width="1282" height="856" alt="image" src="https://github.com/user-attachments/assets/30204734-547d-4188-82af-338a6bd5e607" />
-<img width="1274" height="514" alt="image" src="https://github.com/user-attachments/assets/ebca22ef-7e7e-44eb-bc61-a9330a1fac9a" />
+## Application Overview
 
+![Patch & Mitigation Assessment dashboard](https://github.com/user-attachments/assets/9d9d9268-789f-4864-adaa-97b84b237dce)
 
+The application provides a centralized dashboard for reviewing vulnerability context, assessment status, external intelligence, and recommended responses.
 
-<img width="1172" height="759" alt="image" src="https://github.com/user-attachments/assets/a5a9500f-3e05-480f-a835-e1b40b02b8ba" />
-<img width="1123" height="840" alt="image" src="https://github.com/user-attachments/assets/c7f48c46-e50a-4af2-b249-c4c6d5e1435e" />
+## Vulnerability Intelligence
 
-===========================================================================
+![Vulnerability intelligence overview](https://github.com/user-attachments/assets/c2b58489-0375-4ab3-9296-3e49311c08fd)
 
-NIST SP 1800-31B
+The application retrieves and presents information from three external security intelligence sources:
 
-===========================================================================
-https://www.nccoe.nist.gov/publication/1800-31/VolB/index.html#approach
+- **NVD (National Vulnerability Database):** CVE descriptions, CVSS scores, and severity.
+- **CISA KEV:** Known exploited vulnerabilities and relevant exploitation evidence.
+- **FIRST EPSS:** Probability estimates for exploitation in the next 30 days.
 
-For CIO \& CISO, incl. IT personnel.
-Covers Asset identification and assessment, and how you should handle and prioritize including co-op between different departments in an org.
+External intelligence supports analyst decisions without automatically treating CVSS or EPSS scores as definitive SSVC evidence.
 
-**Scenarios**
+## SSVC Risk Assessment
 
-Scenario 0: Asset Identification and assessment
+![SSVC assessment interface](https://github.com/user-attachments/assets/30551dbb-90d3-415f-81f7-452b637e350c)
 
-Scenario 1: Routing patching
+![SSVC assessment details](https://github.com/user-attachments/assets/746a54d6-d367-4a46-a337-662ac064d9e1)
 
-Scenario 2: Routing patching with cloud delivery model
+The application implements the **SSVC 2.0 Deployer decision tree**, evaluating:
 
-Scenario 3: Emergency patching
+- Exploitation status and system exposure.
+- Exploit utility, derived from automatability and value density.
+- Human impact, derived from safety and mission impact.
+- Vulnerability applicability.
 
-Scenario 4: Emergency mitigation (and backout if needed)
+Based on these factors, the application determines an appropriate response: **Immediate, Out-of-Cycle, Scheduled, or Defer**.
 
-Scenario 5: Isolation of unpatchable assets
+The decision logic supports partial assessments when the available evidence produces an unambiguous outcome, while explicitly identifying unresolved information when it could change the result.
 
-Scenario 6: Patch management system security (or other system with administrative privileged access)
+SSVC prioritization is maintained separately from ServiceNow Incident Impact, Urgency, and Priority.
 
-**Risk Assessment**
+## Dynamic Action Plans
 
-https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-30r1.pdf
+![Mitigation and patching action plans](https://github.com/user-attachments/assets/93604b72-4d8a-4c86-9444-f436f929bbdf)
 
-"Risk is a measure of the extent to which an entity is threatened by a potential circumstance or event, and typically a function of: (i) the adverse impacts that would arise if the circumstance or event occurs; and (ii) the likelihood of occurrence."
+The application generates structured mitigation and patching guidance based on the calculated SSVC decision and available remediation information.
 
-"Risk assessment is the process of identifying, estimating, and prioritizing risks to organizational operations (including mission, functions, image, reputation), organizational assets, individuals, other organizations, and the Nation, resulting from the operation of an information system. Part of risk management incorporates threat and vulnerability analyses, and considers mitigations provided by security controls planned or in place"
+Action plans include recommended steps, responsible roles, operational explanations, and considerations for authorization, testing, rollback, and verification.
 
-Example and implementations of A and B from NIST SP 1800-31
-https://www.nccoe.nist.gov/publication/1800-31/VolC/index.html
+The guidance adapts to patch availability and supports situations where a vendor fix is unavailable or a system is no longer supported.
 
-Vuln. Assessment: https://www.nccoe.nist.gov/publication/1800-31/\_images/image1.png
+## Technical Investigation and Evidence
 
-===========================================================================
+![Technical investigation workspace](https://github.com/user-attachments/assets/30204734-547d-4188-82af-338a6bd5e607)
 
-Stakeholder-Specific Vulnerability Categorization (SSVC)
+A dedicated investigation workspace allows administrators to research recurring incidents, software regressions, update failures, and vulnerability-related issues.
 
-===========================================================================
+It supports searches of accessible ServiceNow Knowledge articles, links to vendor documentation, technical communities, and recent public web results.
 
-https://www.cisa.gov/resources-tools/resources/stakeholder-specific-vulnerability-categorization-ssvc?utm\_source=chatgpt.com
+Administrators can also record supporting URLs, comments, investigation notes, and other relevant evidence.
 
-https://www.first.org/epss/?utm\_source=chatgpt.com
+*Native ServiceNow AI/Now Assist is a potential future integration and is not currently required for the investigation workflow.*
 
-Read the tree implementation if it does not fit your org: 
-  https://www.sei.cmu.edu/documents/606/2021\_019\_001\_653461.pdf
+## Assessment History and Traceability
 
-Vulnerability management should prioritize decisions and actions, not just severity scores.
-Basically, "Given the available evidence, our responsibilities, and the consequences for our organization, what should we do about it?".
-A wider margin of -0.5 to +0.5 of a CVE can often be interpreted.
+![Assessment history](https://github.com/user-attachments/assets/ebca22ef-7e7e-44eb-bc61-a9330a1fac9a)
 
-**Stakeholder perspectives:**
+Assessment revisions preserve the context behind previous decisions, supporting documentation, and changes in vulnerability prioritization over time.
 
-Suppliers is mainly worried about how urgently it should be developed and release a fix.
+This provides a traceable record of how an Incident was assessed and why particular mitigation or patching actions were recommended.
 
-Deployer is worried about the urgency of patching and mitigation.
-Coordinator is concerned about how a vuln. report should be triaged and coordinated.
-  Relevant towards SOC and vuln. coordination.
+## Technology Stack
 
-**SSVC Categories:**
+| Technology | Purpose |
+|---|---|
+| ServiceNow Scoped Application | Application platform and Incident integration |
+| JavaScript | Assessment logic and interactive functionality |
+| Script Includes | Server-side SSVC calculation and action-plan generation |
+| Jelly, HTML and CSS | Custom application interface |
+| GlideRecordSecure | Permission-aware ServiceNow record access |
+| NVD API | CVE and CVSS intelligence |
+| CISA KEV | Known exploitation intelligence |
+| FIRST EPSS | Exploitation probability context |
 
-\* Defer
+## Project Goal
 
-  No immediate action is required, assess again when more relevant info. changes.
+The purpose of this project is to bridge the gap between **security intelligence and practical IT operations**.
 
-\* Scheduled
+Instead of relying exclusively on vulnerability severity scores, the application combines technical evidence, organizational context, structured prioritization, and documented investigation findings to support informed remediation decisions.
 
-  Handle the vuln. within normal planned maintenance and remediation processes.
+The project demonstrates experience with ServiceNow development, API integration, JavaScript, security assessment methodologies, workflow design, and technical problem-solving.
 
-\* Out-of-cycle
+---
 
-  Prioritize remediation outside the normal schedule, reallocating resources where appropriate.
-
-\* Immediate
-  Initiate urgent coordinated action using necessary available resources.
-
-**The main decision factors.**
-
-Factor -> What it asks? -> Possible values
-
-Exploitation -> Is the vulnerability being exploited? -> None, Proof of Concept, Active
-
-System Exposure -> How accessible is the vulnerable system? -> Small, Controlled, Open
-
-Automatable -> Can attackers reliably automate exploitation? -> No, Yes
-
-Value Density -> How valuable is a successful compromise to attackers? -> Diffuse, Concentrated
-
-Utility -> How efficient and rewarding would exploitation be? -> Laborious, Efficient, Super Effective
-
-Human Impact -> What happens to people and the organization's essential functions? -> Low, Medium, High, Very High
-
-
-The reason this is more preferred to an ML or a different algo. Is that this is a traceable system,
-
-so a technician can act upon reason, and see the logic behind the Response priority / final decision.
-
-
-
+**Project status:** Functional prototype developed in a ServiceNow Personal Developer Instance (PDI). Production use would require additional testing, security review, and integration validation.
