@@ -4,6 +4,12 @@
 
 The application integrates vulnerability intelligence with the **SSVC 2.0 Deployer decision tree** and generates actionable mitigation and patching guidance directly from ServiceNow Incident records.
 
+### Access Application
+
+Use the "Access Patch Risk" button under an Incident.
+<img width="2555" height="41" alt="image" src="https://github.com/user-attachments/assets/79d091e0-52a8-4ccc-a259-713722fcec9d" />
+
+
 ## Application Overview
 
 ![Patch & Mitigation Assessment dashboard](https://github.com/user-attachments/assets/9d9d9268-789f-4864-adaa-97b84b237dce)
