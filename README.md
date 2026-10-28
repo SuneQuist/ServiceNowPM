@@ -1,5 +1,16 @@
-# ServiceNowPM
-ServiecNow Patching &amp; Mitigation Scoped App
+#ServiecNow Patching &amp; Mitigation Scoped App
+
+<img width="1275" height="1190" alt="image" src="https://github.com/user-attachments/assets/9d9d9268-789f-4864-adaa-97b84b237dce" />
+<img width="1283" height="1187" alt="image" src="https://github.com/user-attachments/assets/c2b58489-0375-4ab3-9296-3e49311c08fd" />
+
+<img width="1279" height="1186" alt="image" src="https://github.com/user-attachments/assets/30551dbb-90d3-415f-81f7-452b637e350c" />
+<img width="1268" height="596" alt="image" src="https://github.com/user-attachments/assets/746a54d6-d367-4a46-a337-662ac064d9e1" />
+
+<img width="1261" height="1083" alt="image" src="https://github.com/user-attachments/assets/93604b72-4d8a-4c86-9444-f436f929bbdf" />
+<img width="1282" height="856" alt="image" src="https://github.com/user-attachments/assets/30204734-547d-4188-82af-338a6bd5e607" />
+<img width="1274" height="514" alt="image" src="https://github.com/user-attachments/assets/ebca22ef-7e7e-44eb-bc61-a9330a1fac9a" />
+
+
 
 <img width="1172" height="759" alt="image" src="https://github.com/user-attachments/assets/a5a9500f-3e05-480f-a835-e1b40b02b8ba" />
 <img width="1123" height="840" alt="image" src="https://github.com/user-attachments/assets/c7f48c46-e50a-4af2-b249-c4c6d5e1435e" />
